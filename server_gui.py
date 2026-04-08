@@ -1,17 +1,4 @@
-"""
-Simple Chat Application - Server Admin GUI
-==========================================
-Author  : Chat App Project
-Date    : 2026-03-10
-Python  : 3.x
 
-How to run:
-    python server_gui.py
-
-This launches a graphical admin panel that runs the chat server
-in the background and lets you monitor connections, read logs,
-send admin announcements, and kick users.
-"""
 
 import threading
 import tkinter as tk

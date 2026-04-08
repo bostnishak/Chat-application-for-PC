@@ -1,21 +1,4 @@
-"""
-Simple Chat Application - Graphical Client
-===========================================
-Author  : Chat App Project
-Date    : 2026-03-10
-Python  : 3.x
 
-Features
---------
-- Login with username + password (register on first use)
-- Real-time group messaging
-- Private messages : type  @username message
-- Admin announcements shown in gold colour
-- Online user list in sidebar
-
-How to run:
-    python client_gui.py
-"""
 
 import socket
 import threading
@@ -40,6 +23,7 @@ TEXT_HISTORY  = "#b4a7d6"          # Muted purple for history replay
 TEXT_DM       = "#f5c2e7"          # Pale pink for DM received
 TEXT_DM_SENT  = "#94e2d5"          # Teal for DM sent
 TEXT_ANNOUNCE = "#f9e2af"          # Gold for admin announcements
+TEXT_WARN     = "#f38ba8"          # Red for warnings / unread badges
 BTN_BG        = "#7c6af7"
 BTN_FG        = "#ffffff"
 INPUT_BG      = "#313244"
@@ -280,6 +264,13 @@ class ChatWindow(tk.Toplevel):
         self.chat_box:    scrolledtext.ScrolledText          # created in _build_ui
         self.users_frame: tk.Frame                           # created in _build_ui
         self.msg_entry:   tk.Entry                           # created in _build_ui
+        
+        self.chat_histories: dict[str, list[dict[str, str]]] = {"#General": []}
+        self.unread_counts: dict[str, int] = {"#General": 0}
+        self.active_chat: str = "#General"
+        self.last_known_users: list[str] = []
+        self.header_lbl: tk.Label
+
         self._center(940, 660)
         self._build_ui()
 
@@ -308,10 +299,11 @@ class ChatWindow(tk.Toplevel):
         top_bar = tk.Frame(self, bg=BG_MID, pady=10, padx=16)
         top_bar.pack(fill="x")
 
-        tk.Label(
-            top_bar, text="💬  ChatApp",
+        self.header_lbl = tk.Label(
+            top_bar, text="💬  General Group",
             font=FONT_TITLE, fg=ACCENT, bg=BG_MID
-        ).pack(side="left")
+        )
+        self.header_lbl.pack(side="left")
 
         tk.Label(
             top_bar,
@@ -330,13 +322,13 @@ class ChatWindow(tk.Toplevel):
         main = tk.Frame(self, bg=BG_DARK)
         main.pack(fill="both", expand=True)
 
-        # Sidebar – Online Users
-        sidebar = tk.Frame(main, bg=BG_PANEL, width=190, padx=10, pady=12)
-        sidebar.pack(side="right", fill="y")
+        # Sidebar – Chats
+        sidebar = tk.Frame(main, bg=BG_PANEL, width=220, padx=10, pady=12)
+        sidebar.pack(side="left", fill="y")
         sidebar.pack_propagate(False)
 
         tk.Label(
-            sidebar, text="🟢  Online Users",
+            sidebar, text="🟢  Chats",
             font=FONT_BOLD, fg=TEXT_SYSTEM, bg=BG_PANEL
         ).pack(anchor="w")
 
@@ -345,18 +337,9 @@ class ChatWindow(tk.Toplevel):
         self.users_frame = tk.Frame(sidebar, bg=BG_PANEL)
         self.users_frame.pack(fill="both", expand=True)
 
-        # DM hint
-        tk.Frame(sidebar, bg=TEXT_DIM, height=1).pack(fill="x", pady=(8, 4))
-        tk.Label(
-            sidebar,
-            text="💡 DM: @user message",
-            font=FONT_SMALL, fg=TEXT_DIM, bg=BG_PANEL,
-            wraplength=160, justify="left"
-        ).pack(anchor="w")
-
         # Chat area
         chat_area = tk.Frame(main, bg=BG_DARK)
-        chat_area.pack(side="left", fill="both", expand=True, padx=10, pady=10)
+        chat_area.pack(side="right", fill="both", expand=True, padx=10, pady=10)
 
         # Message display
         self.chat_box = scrolledtext.ScrolledText(
@@ -413,15 +396,60 @@ class ChatWindow(tk.Toplevel):
         self.chat_box.config(state="disabled")
         self.chat_box.see("end")
 
-    def _append_history_header(self) -> None:
-        self.chat_box.config(state="normal")
-        self.chat_box.insert("end", "  ─────── Previous Messages ───────\n", "history")
-        self.chat_box.config(state="disabled")
+    def _update_chats_list(self, usernames: List[str]) -> None:
+        for widget in self.users_frame.winfo_children():
+            widget.destroy()
+            
+        chats_to_render = ["#General"] + [u for u in usernames if u != self.username]
+        
+        for name in chats_to_render:
+            if name not in self.chat_histories:
+                self.chat_histories[name] = []
+            if name not in self.unread_counts:
+                self.unread_counts[name] = 0
+                
+            row = tk.Frame(self.users_frame, bg=ACCENT if self.active_chat == name else BG_PANEL, cursor="hand2")
+            row.pack(fill="x", pady=2)
+            
+            unread = self.unread_counts.get(name, 0)
+            dot_text = f" [{unread}] " if unread > 0 else "● "
+            dot_color = TEXT_WARN if unread > 0 else (ONLINE_COLOR if name == "#General" else TEXT_SYSTEM)
+            
+            dot = tk.Label(row, text=dot_text, fg=dot_color, bg=row['bg'], font=FONT_SMALL)
+            dot.pack(side="left")
+            
+            lbl_text = "General Group" if name == "#General" else name
+            lbl = tk.Label(
+                row, text=f" {lbl_text}",
+                font=FONT_BOLD if unread > 0 else FONT_MSG,
+                fg=BTN_FG if self.active_chat == name else TEXT_MAIN,
+                bg=row['bg'], anchor="w"
+            )
+            lbl.pack(side="left", fill="x")
 
-    def _append_history_footer(self) -> None:
+            def _select(_event: "tk.Event[tk.Widget]", _name=name):
+                self._switch_chat(_name)
+
+            for w in (row, dot, lbl):
+                w.bind("<Button-1>", _select)  # type: ignore[arg-type]
+
+    def _switch_chat(self, chat_name: str) -> None:
+        self.active_chat = chat_name
+        self.unread_counts[chat_name] = 0
+        
+        chat_title = "General Group" if chat_name == "#General" else f"@{chat_name}"
+        self.header_lbl.config(text=f"💬  {chat_title}")
+        
+        self.after(0, lambda: self._update_chats_list(self.last_known_users))
+        self.after(0, self._render_current_history)
+
+    def _render_current_history(self) -> None:
         self.chat_box.config(state="normal")
-        self.chat_box.insert("end", "  ──────────────────────────────────\n", "history")
+        self.chat_box.delete("1.0", tk.END)
+        for msg_dict in self.chat_histories.get(self.active_chat, []):
+            self.chat_box.insert("end", msg_dict["text"] + "\n", msg_dict["tag"])
         self.chat_box.config(state="disabled")
+        self.chat_box.see("end")
 
     def _update_user_list(self, usernames: List[str]) -> None:
         for widget in self.users_frame.winfo_children():
@@ -459,95 +487,83 @@ class ChatWindow(tk.Toplevel):
                     self.after(0, self._connection_lost)  # type: ignore[arg-type]
                 break
 
-    # Track whether we're in the history section
-    _history_started: bool = False
-
     def _handle_incoming(self, data: str) -> None:
         """Parse and dispatch server messages."""
-
-        # ── System message ──────────────────────
-        if data.startswith("SYSTEM:"):
-            msg = data.removeprefix("SYSTEM:")
-            if self._history_started:
-                self.after(0, self._append_history_footer)  # type: ignore[arg-type]
-                self._history_started = False
-            self.after(0, lambda m=msg: self._append_message(f"  ℹ  {m}", "system"))
-
-        # ── User list update ────────────────────
-        elif data.startswith("USERLIST:"):
+        if data.startswith("USERLIST:"):
             raw_list = data.removeprefix("USERLIST:")
             users = [u.strip() for u in raw_list.split(",") if u.strip()]
-            self.after(0, lambda ul=users: self._update_user_list(ul))
+            self.last_known_users = users
+            self.after(0, lambda: self._update_chats_list(users))
+            return
 
-        # ── Chat history ────────────────────────
-        elif data.startswith("HISTORY:"):
-            msg = data.removeprefix("HISTORY:")
-            if not self._history_started:
-                self._history_started = True
-                self.after(0, self._append_history_header)  # type: ignore[arg-type]
-            self.after(0, lambda m=msg: self._append_message(f"  {m}", "history"))
+        if data.startswith("HISTORY|"):
+            data = data.removeprefix("HISTORY|")
 
-        # ── Admin announcement ──────────────────
-        elif data.startswith("ANNOUNCE:"):
-            if self._history_started:
-                self.after(0, self._append_history_footer)  # type: ignore[arg-type]
-                self._history_started = False
-            msg = data.removeprefix("ANNOUNCE:")
-            self.after(0, lambda m=msg: self._append_message(f"  📢  {m}", "announce"))
-
-        # ── Private message received ────────────
-        elif data.startswith("DM:"):
-            if self._history_started:
-                self.after(0, self._append_history_footer)  # type: ignore[arg-type]
-                self._history_started = False
-            msg = data.removeprefix("DM:")
-            self.after(0, lambda m=msg: self._append_message(f"  {m}", "dm"))
-
-        # ── Private message sent (echo) ─────────
-        elif data.startswith("DM_SENT:"):
-            if self._history_started:
-                self.after(0, self._append_history_footer)  # type: ignore[arg-type]
-                self._history_started = False
-            msg = data.removeprefix("DM_SENT:")
-            self.after(0, lambda m=msg: self._append_message(f"  {m}", "dm_sent"))
-
-        # ── Normal chat message ─────────────────
-        elif data.startswith("MSG:"):
-            if self._history_started:
-                self.after(0, self._append_history_footer)  # type: ignore[arg-type]
-                self._history_started = False
-            msg = data.removeprefix("MSG:")
-            # Format: "[HH:MM] username: message body"
-            if ": " in msg:
-                rest = msg
-                timestamp = ""
-                if rest.startswith("[") and "]" in rest:
-                    parts = rest.split("]", 1)
-                    timestamp = parts[0] + "] "
-                    rest = parts[1].strip()
-
-                if ": " in rest:
-                    sender, _, body = rest.partition(": ")
-                    sender = sender.strip()
-                    body   = body.strip()
-                    if sender == self.username:
-                        tag    = "own"
-                        prefix = "  ➤ You"
-                    else:
-                        tag    = "other"
-                        prefix = f"  {sender}"
-                    display = f"{prefix}  {timestamp}{body}"
-                    self.after(0, lambda d=display, t=tag: self._append_message(d, t))
+        parts = data.split("|", 3)
+        if len(parts) >= 4:
+            msg_type = parts[0]
+            ts = parts[1]
+            target_user = parts[2]
+            body = parts[3]
+            
+            chat_target = "#General"
+            tag = "other"
+            prefix = ""
+            display = ""
+            
+            if msg_type == "MSG":
+                chat_target = "#General"
+                if target_user == self.username:
+                    tag = "own"
+                    prefix = "  ➤ You"
                 else:
-                    self.after(0, lambda m=msg: self._append_message(f"  {m}", "other"))
+                    tag = "other"
+                    prefix = f"  {target_user}"
+                display = f"{prefix}  {ts}  {body}"
+                
+            elif msg_type == "DM":
+                chat_target = target_user
+                tag = "dm"
+                display = f"  {target_user}  {ts}  {body}"
+                
+            elif msg_type == "DM_SENT":
+                chat_target = target_user
+                tag = "dm_sent"
+                display = f"  ➤ You  {ts}  {body}"
+                
+            elif msg_type == "SYSTEM":
+                chat_target = "#General"
+                tag = "system"
+                display = f"  ℹ  {ts}  {body}"
+                
+            elif msg_type == "ANNOUNCE":
+                chat_target = "#General"
+                tag = "announce"
+                display = f"  📢  {ts} Admin: {body}"
             else:
-                self.after(0, lambda m=msg: self._append_message(f"  {m}", "other"))
+                return
+
+            if chat_target not in self.chat_histories:
+                self.chat_histories[chat_target] = []
+            
+            self.chat_histories[chat_target].append({"text": display, "tag": tag})
+            
+            if self.active_chat == chat_target:
+                self.after(0, lambda d=display, t=tag: self._append_message(d, t))
+            else:
+                if target_user != self.username and msg_type != "DM_SENT":
+                    self.unread_counts[chat_target] = self.unread_counts.get(chat_target, 0) + 1
+                    self.after(0, lambda: self._update_chats_list(self.last_known_users))
 
     def _send_message(self) -> None:
         msg = self.msg_entry.get().strip()
         if not msg:
             return
         self.msg_entry.delete(0, tk.END)
+        
+        if self.active_chat != "#General":
+            msg = f"@{self.active_chat} {msg}"
+            
         try:
             self.client_socket.send(msg.encode(ENCODING))
         except Exception:

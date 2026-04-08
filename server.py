@@ -1,23 +1,4 @@
-"""
-Simple Chat Application - Server
-=================================
-Author  : Chat App Project
-Date    : 2026-03-10
-Python  : 3.x
 
-Features
---------
-- Multi-client real-time messaging over TCP/IP
-- User login with username + password authentication
-- Private messages  :  @recipient message
-- Admin broadcast   :  server_gui calls broadcast_admin()
-- Kick user         :  server_gui calls kick_user()
-- Chat history      :  last MAX_HISTORY messages replayed on join
-
-How to run:
-    python run_server.py   (terminal only)
-    python server_gui.py   (admin panel with GUI)
-"""
 
 import json
 import os
@@ -145,7 +126,7 @@ def broadcast_admin(message: str) -> None:
     Safe to call from any thread (e.g. the GUI thread).
     """
     ts = _timestamp()
-    full = f"ANNOUNCE:[{ts}] 📢 Admin: {message}"
+    full = f"ANNOUNCE|[{ts}]|Admin|{message}"
     _log(f"[ANNOUNCE] {message}")
     broadcast(full)
 
@@ -171,7 +152,7 @@ def send_history(client_socket: socket.socket) -> None:
 
     for msg in history_copy:
         try:
-            client_socket.send(("HISTORY:" + msg).encode(ENCODING))
+            client_socket.send((f"HISTORY|{msg}").encode(ENCODING))
         except Exception:
             break
 
@@ -203,14 +184,14 @@ def _send_private(sender: str, recipient: str, body: str) -> None:
         if send_sock:
             try:
                 send_sock.send(
-                    f"SYSTEM:[{ts}] ⚠  '{recipient}' is not online.".encode(ENCODING)
+                    f"SYSTEM|[{ts}]|System|⚠  '{recipient}' is not online.".encode(ENCODING)
                 )
             except Exception:
                 pass
         return
 
-    dm_to_recipient = f"DM:[{ts}] 🔒 {sender} → you: {body}"
-    dm_to_sender    = f"DM_SENT:[{ts}] 🔒 you → {recipient}: {body}"
+    dm_to_recipient = f"DM|[{ts}]|{sender}|{body}"
+    dm_to_sender    = f"DM_SENT|[{ts}]|{recipient}|{body}"
 
     try:
         recv_sock.send(dm_to_recipient.encode(ENCODING))
@@ -240,7 +221,7 @@ def kick_user(username: str) -> bool:
 
     # Send the kick notice before closing
     try:
-        sock.send("SYSTEM:You have been kicked by the admin.".encode(ENCODING))
+        sock.send(f"SYSTEM|[{_timestamp()}]|System|You have been kicked by the admin.".encode(ENCODING))
     except Exception:
         pass
     try:
@@ -249,7 +230,7 @@ def kick_user(username: str) -> bool:
         pass
 
     _log(f"[KICK] {username} was kicked by admin")
-    broadcast(f"SYSTEM:{username} was kicked by the admin.")
+    broadcast(f"SYSTEM|[{_timestamp()}]|System|{username} was kicked by the admin.")
     send_user_list()
 
     if on_user_leave is not None:
@@ -305,9 +286,9 @@ def handle_client(client_socket: socket.socket, address: tuple) -> None:
         send_history(client_socket)
 
         ts = _timestamp()
-        broadcast(f"SYSTEM:[{ts}] {username} has joined the chat! 👋", exclude=username)
+        broadcast(f"SYSTEM|[{ts}]|System|{username} has joined the chat! 👋", exclude=username)
         client_socket.send(
-            f"SYSTEM:[{ts}] Welcome to the chat, {username}!".encode(ENCODING)
+            f"SYSTEM|[{ts}]|System|Welcome to the chat, {username}!".encode(ENCODING)
         )
         send_user_list()
 
@@ -336,22 +317,23 @@ def handle_client(client_socket: socket.socket, address: tuple) -> None:
                 # malformed DM – fall through to broadcast
 
             ts = _timestamp()
-            formatted = f"[{ts}] {username}: {message}"
-            _log(f"  [{address[0]}] {formatted}")
-            _add_to_history(formatted)
+            formatted_log = f"[{ts}] {username}: {message}"
+            payload = f"MSG|[{ts}]|{username}|{message}"
+            _log(f"  [{address[0]}] {formatted_log}")
+            _add_to_history(payload)
 
             if on_message is not None:
                 try:
-                    on_message(formatted)
+                    on_message(formatted_log)
                 except Exception:
                     pass
 
             # Echo back to sender + broadcast to others
             try:
-                client_socket.send(("MSG:" + formatted).encode(ENCODING))
+                client_socket.send(payload.encode(ENCODING))
             except Exception:
                 break
-            broadcast("MSG:" + formatted, exclude=username)
+            broadcast(payload, exclude=username)
 
     except ConnectionResetError:
         pass  # client disconnected abruptly — normal on Windows
@@ -368,7 +350,7 @@ def handle_client(client_socket: socket.socket, address: tuple) -> None:
 
             _log(f"[-] {username} disconnected")
             ts = _timestamp()
-            broadcast(f"SYSTEM:[{ts}] {username} has left the chat.")
+            broadcast(f"SYSTEM|[{ts}]|System|{username} has left the chat.")
             send_user_list()
 
             if on_user_leave is not None:
@@ -456,7 +438,7 @@ def _cleanup() -> None:
     with lock:
         for sock in clients.values():
             try:
-                sock.send("SYSTEM:Server is shutting down.".encode(ENCODING))
+                sock.send(f"SYSTEM|[{_timestamp()}]|System|Server is shutting down.".encode(ENCODING))
                 sock.close()
             except Exception:
                 pass
