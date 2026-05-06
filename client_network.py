@@ -69,15 +69,17 @@ def recv_packet(sock: socket.socket):
     return header, None
 
 
-def connect_and_login(host: str, port: int, username: str, password: str):
+def connect_and_login(host: str, port: int, action: str, username: str, password: str):
     """
-    Connect to server, send credentials, return (socket, first_message) or raise.
+    Connect to server, send action, credentials, return (socket, first_message) or raise.
     """
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.connect((host, port))
 
-    send_text(sock, username)
+    send_text(sock, action)
     import time; time.sleep(0.05)
+    send_text(sock, username)
+    time.sleep(0.05)
     send_text(sock, password)
 
     header, _ = recv_packet(sock)
@@ -90,5 +92,11 @@ def connect_and_login(host: str, port: int, username: str, password: str):
     if header.startswith("ERROR:WRONG_PASS"):
         sock.close()
         raise PermissionError("WRONG_PASS")
+    if header.startswith("ERROR:NOT_FOUND"):
+        sock.close()
+        raise PermissionError("NOT_FOUND")
+    if header.startswith("ERROR:ALREADY_EXISTS"):
+        sock.close()
+        raise PermissionError("ALREADY_EXISTS")
 
     return sock, header

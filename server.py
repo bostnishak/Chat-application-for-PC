@@ -29,12 +29,20 @@ groups: Dict[str, dict] = {}
 lock: threading.Lock = threading.Lock()
 _running: bool = False
 
+# Offline message queue: {username: [packet_str, ...]}
+# Stores DMs sent to users who are currently offline.
+offline_queue: Dict[str, list] = {}
+
+# Muted users: cannot send messages but can receive.
+muted_users: Set[str] = set()
+
 # GUI callback hooks (set by server_gui.py)
-on_user_join:  Optional[Callable[[str], None]] = None
-on_user_leave: Optional[Callable[[str], None]] = None
-on_message:    Optional[Callable[[str], None]] = None
-on_log:        Optional[Callable[[str], None]] = None
+on_user_join:    Optional[Callable[[str], None]] = None
+on_user_leave:   Optional[Callable[[str], None]] = None
+on_message:      Optional[Callable[[str], None]] = None
+on_log:          Optional[Callable[[str], None]] = None
 on_group_update: Optional[Callable[[], None]] = None
+on_mute_update:  Optional[Callable[[], None]] = None
 
 # ─────────────────────────────────────────────
 # User Account Storage
@@ -57,16 +65,22 @@ def _save_users(users: dict) -> None:
         pass
 
 
-def _authenticate(username: str, password: str) -> str:
+def _authenticate(action: str, username: str, password: str) -> str:
     users = _load_users()
-    if username in users:
+    if action == "LOGIN":
+        if username not in users:
+            return "NOT_FOUND"
         if users[username] == password:
             return "OK"
         return "WRONG_PASS"
-    users[username] = password
-    _save_users(users)
-    _log(f"[AUTH] New user registered: {username}")
-    return "OK"
+    elif action == "REGISTER":
+        if username in users:
+            return "ALREADY_EXISTS"
+        users[username] = password
+        _save_users(users)
+        _log(f"[AUTH] New user registered: {username}")
+        return "OK"
+    return "UNKNOWN_ACTION"
 
 
 # ─────────────────────────────────────────────
@@ -240,14 +254,42 @@ def _send_private(sender: str, recipient: str, body: str) -> None:
         send_sock = clients.get(sender)
 
     if recv_sock is None:
+        # ── Recipient offline: queue the message ──────────────────
+        with lock:
+            offline_queue.setdefault(recipient, []).append(
+                f"DM|[{ts}]|{sender}|{body}"
+            )
+        _log(f"  [QUEUE] DM from {sender} queued for offline user '{recipient}'")
         if send_sock:
-            _send_text(send_sock, f"SYSTEM|[{ts}]|System|⚠  '{recipient}' is not online.")
+            _send_text(
+                send_sock,
+                f"SYSTEM|[{ts}]|System|📨  '{recipient}' is offline. Message queued.",
+            )
+        if send_sock:
+            _send_text(send_sock, f"DM_SENT|[{ts}]|{recipient}|{body}")
         return
 
     _send_text(recv_sock, f"DM|[{ts}]|{sender}|{body}")
     if send_sock:
         _send_text(send_sock, f"DM_SENT|[{ts}]|{recipient}|{body}")
     _log(f"  [DM] {sender} → {recipient}: {body}")
+
+
+def _deliver_offline_queue(username: str) -> None:
+    """Deliver any queued messages to a user who has just come online."""
+    with lock:
+        pending = offline_queue.pop(username, [])
+        sock = clients.get(username)
+    if not pending or sock is None:
+        return
+    ts = _timestamp()
+    _send_text(sock, f"SYSTEM|[{ts}]|System|📬  You have {len(pending)} queued message(s):")
+    for packet in pending:
+        try:
+            _send_text(sock, packet)
+        except Exception:
+            break
+    _log(f"  [QUEUE] Delivered {len(pending)} queued message(s) to {username}")
 
 
 def _relay_file(sender: str, recipient: str, filename: str, data: bytes, is_group: bool = False) -> None:
@@ -407,6 +449,44 @@ def kick_user(username: str) -> bool:
     return True
 
 
+def mute_user(username: str) -> bool:
+    """Mute a user — they can receive but not send messages. Returns False if already muted."""
+    if username in muted_users:
+        return False
+    muted_users.add(username)
+    _log(f"[MUTE] {username} was muted by admin")
+    ts = _timestamp()
+    with lock:
+        sock = clients.get(username)
+    if sock:
+        _send_text(sock, f"SYSTEM|[{ts}]|System|🔇  You have been muted by an admin.")
+    broadcast_text(f"SYSTEM|[{ts}]|System|🔇  {username} has been muted.")
+    if on_mute_update is not None:
+        try:
+            on_mute_update()
+        except Exception:
+            pass
+    return True
+
+
+def unmute_user(username: str) -> bool:
+    """Unmute a user. Returns False if they were not muted."""
+    if username not in muted_users:
+        return False
+    muted_users.discard(username)
+    _log(f"[UNMUTE] {username} was unmuted by admin")
+    ts = _timestamp()
+    with lock:
+        sock = clients.get(username)
+    if sock:
+        _send_text(sock, f"SYSTEM|[{ts}]|System|🔊  You have been unmuted by an admin.")
+    if on_mute_update is not None:
+        try:
+            on_mute_update()
+        except Exception:
+            pass
+    return True
+
 # ─────────────────────────────────────────────
 # Client handler
 # ─────────────────────────────────────────────
@@ -414,8 +494,18 @@ def handle_client(client_socket: socket.socket, address: tuple) -> None:
     username: Optional[str] = None
 
     try:
-        # Step 1: Receive username
+        # Step 1: Receive Action (LOGIN or REGISTER)
         _, _ = None, None
+        raw_len = _recv_exact(client_socket, 4)
+        if not raw_len:
+            client_socket.close(); return
+        msg_len = struct.unpack("!I", raw_len)[0]
+        raw_msg = _recv_exact(client_socket, msg_len)
+        if not raw_msg:
+            client_socket.close(); return
+        action = raw_msg.decode(ENCODING).strip()
+
+        # Step 2: Receive username
         raw_len = _recv_exact(client_socket, 4)
         if not raw_len:
             client_socket.close(); return
@@ -425,7 +515,7 @@ def handle_client(client_socket: socket.socket, address: tuple) -> None:
             client_socket.close(); return
         username = raw_msg.decode(ENCODING).strip()
 
-        # Step 2: Receive password
+        # Step 3: Receive password
         raw_len = _recv_exact(client_socket, 4)
         if not raw_len:
             client_socket.close(); return
@@ -435,14 +525,14 @@ def handle_client(client_socket: socket.socket, address: tuple) -> None:
             client_socket.close(); return
         password = raw_msg.decode(ENCODING).strip()
 
-        # Step 3: Authenticate
-        auth_result = _authenticate(username, password)
-        if auth_result == "WRONG_PASS":
-            _send_text(client_socket, "ERROR:WRONG_PASS")
+        # Step 4: Authenticate
+        auth_result = _authenticate(action, username, password)
+        if auth_result != "OK":
+            _send_text(client_socket, f"ERROR:{auth_result}")
             client_socket.close()
             return
 
-        # Step 4: Check duplicate
+        # Step 5: Check duplicate
         with lock:
             if username in clients:
                 _send_text(client_socket, "ERROR:USERNAME_TAKEN")
@@ -458,6 +548,13 @@ def handle_client(client_socket: socket.socket, address: tuple) -> None:
         broadcast_text(f"SYSTEM|[{ts}]|System|{username} has joined the chat! 👋", exclude=username)
         _send_text(client_socket, f"SYSTEM|[{ts}]|System|Welcome to the chat, {username}! 🎉")
         send_user_list()
+
+        # Deliver any queued offline messages
+        _deliver_offline_queue(username)
+
+        # Notify if muted
+        if username in muted_users:
+            _send_text(client_socket, f"SYSTEM|[{ts}]|System|🔇  You are currently muted by an admin.")
 
         if on_user_join is not None:
             try:
@@ -477,7 +574,10 @@ def handle_client(client_socket: socket.socket, address: tuple) -> None:
 
             # ── File transfer ──────────────────────
             if message.startswith("FILE_DATA|"):
-                # FILE_DATA|recipient|filename
+                if username in muted_users:
+                    ts_m = _timestamp()
+                    _send_text(client_socket, f"SYSTEM|[{ts_m}]|System|🔇  You are muted and cannot send files.")
+                    continue
                 parts = message.split("|", 3)
                 if len(parts) >= 3 and data is not None:
                     _, recipient, filename = parts[0], parts[1], parts[2]
@@ -504,7 +604,10 @@ def handle_client(client_socket: socket.socket, address: tuple) -> None:
                 continue
 
             if message.startswith("GROUP_MSG|"):
-                # GROUP_MSG|group_name|body
+                if username in muted_users:
+                    ts_m = _timestamp()
+                    _send_text(client_socket, f"SYSTEM|[{ts_m}]|System|🔇  You are muted and cannot send messages.")
+                    continue
                 parts = message.split("|", 2)
                 if len(parts) == 3:
                     _, group_name, body = parts
@@ -513,12 +616,21 @@ def handle_client(client_socket: socket.socket, address: tuple) -> None:
 
             # ── Private message ────────────────────
             if message.startswith("@"):
+                if username in muted_users:
+                    ts_m = _timestamp()
+                    _send_text(client_socket, f"SYSTEM|[{ts_m}]|System|🔇  You are muted and cannot send messages.")
+                    continue
                 parts = message.removeprefix("@").split(" ", 1)
                 if len(parts) == 2:
                     _send_private(username, parts[0], parts[1])
                 continue
 
             # ── Broadcast message ──────────────────
+            if username in muted_users:
+                ts_m = _timestamp()
+                _send_text(client_socket, f"SYSTEM|[{ts_m}]|System|🔇  You are muted and cannot send messages.")
+                continue
+
             ts = _timestamp()
             payload = f"MSG|[{ts}]|{username}|{message}"
             formatted_log = f"[{ts}] {username}: {message}"

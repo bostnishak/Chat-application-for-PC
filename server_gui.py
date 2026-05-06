@@ -1,5 +1,4 @@
 
-
 import threading
 import tkinter as tk
 from tkinter import messagebox, scrolledtext
@@ -25,8 +24,11 @@ BTN_RED      = "#e06c75"
 BTN_RED_HOV  = "#f38ba8"
 BTN_GOLD     = "#e5a50a"
 BTN_GOLD_HOV = "#f9c74f"
+BTN_MUTE     = "#89b4fa"
+BTN_MUTE_HOV = "#b4d0f7"
 INPUT_BG     = "#313244"
 ONLINE_COLOR = "#a6e3a1"
+MUTED_COLOR  = "#f38ba8"
 
 FONT_MAIN  = ("Segoe UI", 11)
 FONT_BOLD  = ("Segoe UI", 11, "bold")
@@ -64,23 +66,25 @@ class ServerAdminGUI(tk.Tk):
 
         self.log_box: Union[scrolledtext.ScrolledText, _LogBoxStub] = _LogBoxStub()
         self._selected_user: str = ""
-        self.kick_btn: tk.Button  # declared here; assigned in _build_ui
+        self.kick_btn: tk.Button
+        self.mute_btn: tk.Button
         self.status_lbl: tk.Label
         self.users_frame: tk.Frame
         self.user_count_lbl: tk.Label
+        self.queue_lbl: tk.Label
         self.announce_entry: tk.Entry
         self._server_thread: threading.Thread
 
         self.title("ChatApp – Server Admin Panel")
         self.configure(bg=BG_DARK)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
-        self._center(960, 660)
+        self._center(1000, 700)
         self._build_ui()
         self._hook_server()
         self._start_server()
 
     # ── Window helpers ───────────────────────
-    def _center(self, w: int, h: int) -> None:  # noqa: E741
+    def _center(self, w: int, h: int) -> None:
         self.update_idletasks()
         sw: int = self.winfo_screenwidth()
         sh: int = self.winfo_screenheight()
@@ -103,6 +107,22 @@ class ServerAdminGUI(tk.Tk):
         )
         self.status_lbl.pack(side="right")
 
+        # STATS BAR ────────────────────────────
+        stats = tk.Frame(self, bg=BG_PANEL, pady=6, padx=16)
+        stats.pack(fill="x")
+
+        self.queue_lbl = tk.Label(
+            stats, text="📬  Offline queue: 0 pending",
+            font=FONT_SMALL, fg=TEXT_DIM, bg=BG_PANEL,
+        )
+        self.queue_lbl.pack(side="left")
+
+        self.muted_count_lbl = tk.Label(
+            stats, text="🔇  Muted: 0",
+            font=FONT_SMALL, fg=TEXT_DIM, bg=BG_PANEL,
+        )
+        self.muted_count_lbl.pack(side="left", padx=(20, 0))
+
         # MAIN AREA ────────────────────────────
         main = tk.Frame(self, bg=BG_DARK)
         main.pack(fill="both", expand=True, padx=12, pady=10)
@@ -116,7 +136,6 @@ class ServerAdminGUI(tk.Tk):
             font=FONT_BOLD, fg=TEXT_MAIN, bg=BG_DARK, anchor="w",
         ).pack(fill="x", pady=(0, 4))
 
-        # Replace the stub with the real widget
         self.log_box = scrolledtext.ScrolledText(
             left,
             state="disabled",
@@ -127,16 +146,18 @@ class ServerAdminGUI(tk.Tk):
             wrap="word", cursor="arrow",
         )
         self.log_box.pack(fill="both", expand=True)
-        self.log_box.tag_config("info",   foreground=TEXT_MAIN)
-        self.log_box.tag_config("join",   foreground=TEXT_SYSTEM)
-        self.log_box.tag_config("leave",  foreground=TEXT_WARN)
-        self.log_box.tag_config("kick",   foreground=TEXT_WARN,  font=("Consolas", 10, "bold"))
-        self.log_box.tag_config("msg",    foreground="#89b4fa")
-        self.log_box.tag_config("header", foreground=ACCENT,     font=("Consolas", 10, "bold"))
-        self.log_box.tag_config("announce", foreground=TEXT_GOLD, font=("Consolas", 10, "bold"))
+        self.log_box.tag_config("info",     foreground=TEXT_MAIN)
+        self.log_box.tag_config("join",     foreground=TEXT_SYSTEM)
+        self.log_box.tag_config("leave",    foreground=TEXT_WARN)
+        self.log_box.tag_config("kick",     foreground=TEXT_WARN,  font=("Consolas", 10, "bold"))
+        self.log_box.tag_config("mute",     foreground=BTN_MUTE,   font=("Consolas", 10, "bold"))
+        self.log_box.tag_config("queue",    foreground=TEXT_GOLD)
+        self.log_box.tag_config("msg",      foreground="#89b4fa")
+        self.log_box.tag_config("header",   foreground=ACCENT,     font=("Consolas", 10, "bold"))
+        self.log_box.tag_config("announce", foreground=TEXT_GOLD,  font=("Consolas", 10, "bold"))
 
         # RIGHT: Users + controls ──────────────
-        right = tk.Frame(main, bg=BG_PANEL, width=220, padx=10, pady=12)
+        right = tk.Frame(main, bg=BG_PANEL, width=240, padx=10, pady=12)
         right.pack(side="right", fill="y", padx=(12, 0))
         right.pack_propagate(False)
 
@@ -186,6 +207,18 @@ class ServerAdminGUI(tk.Tk):
 
         tk.Frame(right, bg=TEXT_DIM, height=1).pack(fill="x", pady=(0, 10))
 
+        # ── Mute / Unmute button ───────────────
+        self.mute_btn = tk.Button(
+            right, text="🔇  Mute Selected",
+            font=FONT_BOLD, bg=BTN_MUTE, fg="#1e1e2e",
+            activebackground=BTN_MUTE_HOV, activeforeground="#1e1e2e",
+            relief="flat", cursor="hand2", pady=8,
+            command=self._mute_selected,
+        )
+        self.mute_btn.pack(fill="x", pady=(0, 6))
+        self.mute_btn.bind("<Enter>", lambda e, b=self.mute_btn: b.config(bg=BTN_MUTE_HOV))  # type: ignore[arg-type]
+        self.mute_btn.bind("<Leave>", lambda e, b=self.mute_btn: b.config(bg=BTN_MUTE))  # type: ignore[arg-type]
+
         # ── Kick button ────────────────────────
         self.kick_btn = tk.Button(
             right, text="⚡  Kick Selected",
@@ -215,6 +248,7 @@ class ServerAdminGUI(tk.Tk):
         server.on_user_join  = self._on_user_join
         server.on_user_leave = self._on_user_leave
         server.on_message    = self._on_server_message
+        server.on_mute_update = self._on_mute_update
 
     def _start_server(self) -> None:
         """Start the server in a background daemon thread."""
@@ -227,22 +261,40 @@ class ServerAdminGUI(tk.Tk):
 
     # ── Callbacks (server thread → main thread via after()) ──
     def _on_log(self, msg: str) -> None:
-        self.after(0, lambda m=msg: self._append_log(m, "info"))
+        def _do(m=msg):
+            tag = "info"
+            ml = m.lower()
+            if "[queue]" in ml:
+                tag = "queue"
+            elif "[mute]" in ml or "[unmute]" in ml:
+                tag = "mute"
+            elif "[kick]" in ml:
+                tag = "kick"
+            self._append_log(m, tag)
+        self.after(0, _do)
 
     def _on_user_join(self, username: str) -> None:
         self.after(0, lambda u=username: (
             self._append_log(f"  ✅  {u} joined", "join"),
             self._refresh_users(),
+            self._refresh_stats(),
         ))
 
     def _on_user_leave(self, username: str) -> None:
         self.after(0, lambda u=username: (
             self._append_log(f"  ❌  {u} left", "leave"),
             self._refresh_users(),
+            self._refresh_stats(),
         ))
 
     def _on_server_message(self, msg: str) -> None:
         self.after(0, lambda m=msg: self._append_log(f"  💬  {m}", "msg"))
+
+    def _on_mute_update(self) -> None:
+        self.after(0, lambda: (
+            self._refresh_users(),
+            self._refresh_stats(),
+        ))
 
     # ── Log display ───────────────────────────
     def _append_log(self, text: str, tag: str = "info") -> None:
@@ -251,6 +303,21 @@ class ServerAdminGUI(tk.Tk):
         self.log_box.insert("end", text + "\n", tag)
         self.log_box.config(state="disabled")
         self.log_box.see("end")
+
+    # ── Stats bar ─────────────────────────────
+    def _refresh_stats(self) -> None:
+        """Update the offline queue and muted count labels."""
+        with server.lock:
+            total_queued = sum(len(v) for v in server.offline_queue.values())
+        muted_count = len(server.muted_users)
+        self.queue_lbl.config(
+            text=f"📬  Offline queue: {total_queued} pending",
+            fg=TEXT_GOLD if total_queued > 0 else TEXT_DIM,
+        )
+        self.muted_count_lbl.config(
+            text=f"🔇  Muted: {muted_count}",
+            fg=MUTED_COLOR if muted_count > 0 else TEXT_DIM,
+        )
 
     # ── User list ─────────────────────────────
     def _refresh_users(self) -> None:
@@ -271,17 +338,33 @@ class ServerAdminGUI(tk.Tk):
         )
 
     def _add_user_row(self, name: str) -> None:
+        is_muted = name in server.muted_users
         row = tk.Frame(self.users_frame, bg=BG_PANEL, cursor="hand2")
         row.pack(fill="x", pady=2)
 
-        dot = tk.Label(row, text="●", fg=ONLINE_COLOR, bg=BG_PANEL, font=FONT_SMALL)
+        # Online dot / mute icon
+        dot_text = "🔇" if is_muted else "●"
+        dot_color = MUTED_COLOR if is_muted else ONLINE_COLOR
+        dot = tk.Label(row, text=dot_text, fg=dot_color, bg=BG_PANEL, font=FONT_SMALL)
         dot.pack(side="left")
 
         lbl = tk.Label(
             row, text=f"  {name}",
-            font=FONT_MAIN, fg=TEXT_MAIN, bg=BG_PANEL, anchor="w",
+            font=FONT_MAIN, fg=MUTED_COLOR if is_muted else TEXT_MAIN,
+            bg=BG_PANEL, anchor="w",
         )
         lbl.pack(side="left", fill="x")
+
+        # Queued DMs badge
+        with server.lock:
+            queued = len(server.offline_queue.get(name, []))
+        if queued > 0:
+            badge = tk.Label(
+                row, text=f"📬{queued}",
+                font=FONT_SMALL, fg="#1e1e2e", bg=BTN_GOLD,
+                padx=4, pady=1,
+            )
+            badge.pack(side="right", padx=(0, 4))
 
         def _select(
             _event: "tk.Event[tk.Widget]",
@@ -295,6 +378,11 @@ class ServerAdminGUI(tk.Tk):
             _row.config(bg=ACCENT)
             _lbl.config(bg=ACCENT)
             _dot.config(bg=ACCENT)
+            # Update mute button label based on current mute state
+            if _name in server.muted_users:
+                self.mute_btn.config(text="🔊  Unmute Selected")
+            else:
+                self.mute_btn.config(text="🔇  Mute Selected")
 
         for widget in (row, lbl, dot):
             widget.bind("<Button-1>", _select)
@@ -317,6 +405,27 @@ class ServerAdminGUI(tk.Tk):
         self._append_log(f"  📢  Announcement sent: {text}", "announce")
         self.announce_entry.delete(0, tk.END)
 
+    def _mute_selected(self) -> None:
+        if not self._selected_user:
+            messagebox.showinfo("Mute", "Please click on a user first.", parent=self)
+            return
+
+        target = self._selected_user
+
+        if target in server.muted_users:
+            # Unmute
+            if server.unmute_user(target):
+                self._append_log(f"  🔊  Unmuted: {target}", "mute")
+                self.mute_btn.config(text="🔇  Mute Selected")
+        else:
+            # Mute
+            if server.mute_user(target):
+                self._append_log(f"  🔇  Muted: {target}", "mute")
+                self.mute_btn.config(text="🔊  Unmute Selected")
+
+        self._refresh_users()
+        self._refresh_stats()
+
     def _kick_selected(self) -> None:
         if not self._selected_user:
             messagebox.showinfo("Kick", "Please click on a user first.", parent=self)
@@ -333,6 +442,8 @@ class ServerAdminGUI(tk.Tk):
         if server.kick_user(target):
             self._append_log(f"  🔨  Kicked: {target}", "kick")
             self._refresh_users()
+            self._refresh_stats()
+            self.mute_btn.config(text="🔇  Mute Selected")
         else:
             messagebox.showwarning(
                 "Kick", f"'{target}' is no longer connected.", parent=self
