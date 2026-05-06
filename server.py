@@ -1,22 +1,22 @@
 
-
 import json
 import os
 import socket
+import struct
 import threading
 from datetime import datetime
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Optional, Set
 
 # ─────────────────────────────────────────────
 # Configuration
 # ─────────────────────────────────────────────
 HOST: str = "0.0.0.0"
 PORT: int = 5555
-BUFFER: int = 4096
+BUFFER: int = 65536
 ENCODING: str = "utf-8"
-MAX_HISTORY: int = 20
+MAX_HISTORY: int = 50
+MAX_FILE_SIZE: int = 20 * 1024 * 1024  # 20 MB
 
-# File where registered accounts are stored (JSON)
 USERS_FILE: str = os.path.join(os.path.dirname(__file__), "users.json")
 
 # ─────────────────────────────────────────────
@@ -24,6 +24,8 @@ USERS_FILE: str = os.path.join(os.path.dirname(__file__), "users.json")
 # ─────────────────────────────────────────────
 clients: Dict[str, socket.socket] = {}   # {username: socket}
 chat_history: list = []                  # last MAX_HISTORY messages
+# groups: {group_name: {"creator": str, "members": set}}
+groups: Dict[str, dict] = {}
 lock: threading.Lock = threading.Lock()
 _running: bool = False
 
@@ -32,12 +34,12 @@ on_user_join:  Optional[Callable[[str], None]] = None
 on_user_leave: Optional[Callable[[str], None]] = None
 on_message:    Optional[Callable[[str], None]] = None
 on_log:        Optional[Callable[[str], None]] = None
+on_group_update: Optional[Callable[[], None]] = None
 
 # ─────────────────────────────────────────────
 # User Account Storage
 # ─────────────────────────────────────────────
 def _load_users() -> dict:
-    """Load the username→password mapping from disk."""
     if not os.path.exists(USERS_FILE):
         return {}
     try:
@@ -48,7 +50,6 @@ def _load_users() -> dict:
 
 
 def _save_users(users: dict) -> None:
-    """Persist the username→password mapping to disk."""
     try:
         with open(USERS_FILE, "w", encoding="utf-8") as f:
             json.dump(users, f, indent=2)
@@ -57,20 +58,11 @@ def _save_users(users: dict) -> None:
 
 
 def _authenticate(username: str, password: str) -> str:
-    """
-    Validate or register a user.
-
-    Returns
-    -------
-    "OK"          – Credentials accepted (new or returning user).
-    "WRONG_PASS"  – Username exists but password is wrong.
-    """
     users = _load_users()
     if username in users:
         if users[username] == password:
             return "OK"
         return "WRONG_PASS"
-    # First time → register automatically
     users[username] = password
     _save_users(users)
     _log(f"[AUTH] New user registered: {username}")
@@ -85,13 +77,12 @@ def _timestamp() -> str:
 
 
 def _log(msg: str) -> None:
-    """Print to console and notify the GUI (if connected)."""
     print(msg)
     try:
         if on_log is not None:
             on_log(msg)
     except Exception:
-        pass  # Never crash the server thread because of a GUI error
+        pass
 
 
 def _add_to_history(msg: str) -> None:
@@ -102,63 +93,137 @@ def _add_to_history(msg: str) -> None:
 
 
 # ─────────────────────────────────────────────
+# Low-level send helpers
+# ─────────────────────────────────────────────
+def _send_text(sock: socket.socket, message: str) -> bool:
+    """Send a length-prefixed text message."""
+    try:
+        encoded = message.encode(ENCODING)
+        header = struct.pack("!I", len(encoded))
+        sock.sendall(header + encoded)
+        return True
+    except Exception:
+        return False
+
+
+def _send_binary(sock: socket.socket, header_text: str, data: bytes) -> bool:
+    """Send a binary packet: 4-byte text-len + text header + 4-byte data-len + data."""
+    try:
+        hdr_enc = header_text.encode(ENCODING)
+        packet = struct.pack("!I", len(hdr_enc)) + hdr_enc + struct.pack("!I", len(data)) + data
+        sock.sendall(packet)
+        return True
+    except Exception:
+        return False
+
+
+def _recv_exact(sock: socket.socket, n: int) -> Optional[bytes]:
+    """Receive exactly n bytes."""
+    buf = b""
+    while len(buf) < n:
+        try:
+            chunk = sock.recv(n - len(buf))
+            if not chunk:
+                return None
+            buf += chunk
+        except Exception:
+            return None
+    return buf
+
+
+def recv_packet(sock: socket.socket):
+    """
+    Receive one packet. Returns (header: str, data: bytes | None).
+    For text-only packets, data is None.
+    """
+    raw_len = _recv_exact(sock, 4)
+    if raw_len is None:
+        return None, None
+    msg_len = struct.unpack("!I", raw_len)[0]
+    raw_msg = _recv_exact(sock, msg_len)
+    if raw_msg is None:
+        return None, None
+    header = raw_msg.decode(ENCODING)
+
+    # Check if a binary payload follows
+    if header.startswith("FILE_DATA|"):
+        raw_dlen = _recv_exact(sock, 4)
+        if raw_dlen is None:
+            return header, None
+        dlen = struct.unpack("!I", raw_dlen)[0]
+        data = _recv_exact(sock, dlen)
+        return header, data
+
+    return header, None
+
+
+# ─────────────────────────────────────────────
 # Core networking
 # ─────────────────────────────────────────────
-def broadcast(message: str, exclude: Optional[str] = None) -> None:
-    """Send *message* to every connected client except the excluded username."""
-    encoded = message.encode(ENCODING)
+def broadcast_text(message: str, exclude: Optional[str] = None) -> None:
     with lock:
         targets = list(clients.items())
-
     for username, sock in targets:
         if username == exclude:
             continue
         try:
-            sock.send(encoded)
+            _send_text(sock, message)
         except Exception:
             _remove_client(username)
 
 
+# keep old name for backward compat
+def broadcast(message: str, exclude: Optional[str] = None) -> None:
+    broadcast_text(message, exclude)
+
+
 def broadcast_admin(message: str) -> None:
-    """
-    Send an admin announcement to every connected client.
-    Message format on client side: ANNOUNCE:<text>
-    Safe to call from any thread (e.g. the GUI thread).
-    """
     ts = _timestamp()
     full = f"ANNOUNCE|[{ts}]|Admin|{message}"
     _log(f"[ANNOUNCE] {message}")
-    broadcast(full)
+    broadcast_text(full)
 
 
 def send_user_list() -> None:
-    """Push the current online-user list to every connected client."""
     with lock:
         usernames = list(clients.keys())
         sockets   = list(clients.values())
-
-    msg = ("USERLIST:" + ",".join(usernames)).encode(ENCODING)
+    msg = "USERLIST:" + ",".join(usernames)
     for sock in sockets:
         try:
-            sock.send(msg)
+            _send_text(sock, msg)
+        except Exception:
+            pass
+
+
+def send_group_list(target_sock: Optional[socket.socket] = None) -> None:
+    """Send current group list to one socket or all connected clients."""
+    with lock:
+        group_data = {
+            name: {"creator": info["creator"], "members": list(info["members"])}
+            for name, info in groups.items()
+        }
+        all_socks = list(clients.values()) if target_sock is None else [target_sock]
+
+    msg = "GROUPLIST:" + json.dumps(group_data)
+    for sock in all_socks:
+        try:
+            _send_text(sock, msg)
         except Exception:
             pass
 
 
 def send_history(client_socket: socket.socket) -> None:
-    """Send the buffered chat history to a newly-connected client."""
     with lock:
         history_copy = list(chat_history)
-
     for msg in history_copy:
         try:
-            client_socket.send((f"HISTORY|{msg}").encode(ENCODING))
+            _send_text(client_socket, f"HISTORY|{msg}")
         except Exception:
             break
 
 
 def _remove_client(username: str) -> None:
-    """Close and remove a client socket — must NOT be called while holding *lock*."""
     with lock:
         sock = clients.pop(username, None)
     if sock is not None:
@@ -169,76 +234,176 @@ def _remove_client(username: str) -> None:
 
 
 def _send_private(sender: str, recipient: str, body: str) -> None:
-    """
-    Route a private (DM) message from *sender* to *recipient*.
-    Both sender and recipient receive a prefixed message so they
-    know it is private.
-    """
     ts = _timestamp()
     with lock:
         recv_sock = clients.get(recipient)
         send_sock = clients.get(sender)
 
     if recv_sock is None:
-        # Tell sender the recipient is offline
         if send_sock:
-            try:
-                send_sock.send(
-                    f"SYSTEM|[{ts}]|System|⚠  '{recipient}' is not online.".encode(ENCODING)
-                )
-            except Exception:
-                pass
+            _send_text(send_sock, f"SYSTEM|[{ts}]|System|⚠  '{recipient}' is not online.")
         return
 
-    dm_to_recipient = f"DM|[{ts}]|{sender}|{body}"
-    dm_to_sender    = f"DM_SENT|[{ts}]|{recipient}|{body}"
-
-    try:
-        recv_sock.send(dm_to_recipient.encode(ENCODING))
-    except Exception:
-        pass
+    _send_text(recv_sock, f"DM|[{ts}]|{sender}|{body}")
     if send_sock:
-        try:
-            send_sock.send(dm_to_sender.encode(ENCODING))
-        except Exception:
-            pass
-
+        _send_text(send_sock, f"DM_SENT|[{ts}]|{recipient}|{body}")
     _log(f"  [DM] {sender} → {recipient}: {body}")
 
 
-def kick_user(username: str) -> bool:
-    """
-    Kick *username* from the server.
+def _relay_file(sender: str, recipient: str, filename: str, data: bytes, is_group: bool = False) -> None:
+    """Relay a binary file to recipient(s)."""
+    ts = _timestamp()
+    fsize = len(data)
+    header = f"FILE_DATA|[{ts}]|{sender}|{recipient}|{filename}|{fsize}"
 
-    Returns True if the user was found and removed, False otherwise.
-    This function is safe to call from the GUI thread.
-    """
+    if is_group:
+        # recipient is a group name
+        with lock:
+            members = set(groups.get(recipient, {}).get("members", set()))
+            targets = [(u, s) for u, s in clients.items() if u in members and u != sender]
+            send_sock = clients.get(sender)
+
+        for _uname, sock in targets:
+            try:
+                _send_binary(sock, header, data)
+            except Exception:
+                pass
+        # echo to sender
+        if send_sock:
+            sent_hdr = f"FILE_SENT|[{ts}]|{sender}|{recipient}|{filename}|{fsize}"
+            try:
+                _send_binary(send_sock, sent_hdr, data)
+            except Exception:
+                pass
+    else:
+        with lock:
+            recv_sock = clients.get(recipient)
+            send_sock = clients.get(sender)
+
+        if recv_sock is None:
+            if send_sock:
+                _send_text(send_sock, f"SYSTEM|[{ts}]|System|⚠  '{recipient}' is not online.")
+            return
+
+        try:
+            _send_binary(recv_sock, header, data)
+        except Exception:
+            pass
+        if send_sock:
+            sent_hdr = f"FILE_SENT|[{ts}]|{sender}|{recipient}|{filename}|{fsize}"
+            try:
+                _send_binary(send_sock, sent_hdr, data)
+            except Exception:
+                pass
+
+    _log(f"  [FILE] {sender} → {recipient}: {filename} ({fsize} bytes)")
+
+
+# ─────────────────────────────────────────────
+# Group management
+# ─────────────────────────────────────────────
+def _create_group(creator: str, group_name: str) -> str:
+    with lock:
+        if group_name in groups:
+            return "EXISTS"
+        groups[group_name] = {"creator": creator, "members": {creator}}
+    _log(f"[GROUP] {creator} created group '{group_name}'")
+    ts = _timestamp()
+    broadcast_text(f"SYSTEM|[{ts}]|System|📢 New group created: '{group_name}' by {creator}")
+    send_group_list()
+    if on_group_update:
+        try:
+            on_group_update()
+        except Exception:
+            pass
+    return "OK"
+
+
+def _join_group(username: str, group_name: str) -> str:
+    with lock:
+        if group_name not in groups:
+            return "NOT_FOUND"
+        groups[group_name]["members"].add(username)
+    _log(f"[GROUP] {username} joined '{group_name}'")
+    ts = _timestamp()
+    _send_group_msg("System", group_name, f"{username} joined the group 👋", system=True)
+    send_group_list()
+    if on_group_update:
+        try:
+            on_group_update()
+        except Exception:
+            pass
+    return "OK"
+
+
+def _leave_group(username: str, group_name: str) -> None:
+    with lock:
+        if group_name in groups:
+            groups[group_name]["members"].discard(username)
+            if not groups[group_name]["members"]:
+                del groups[group_name]
+    send_group_list()
+    if on_group_update:
+        try:
+            on_group_update()
+        except Exception:
+            pass
+
+
+def _send_group_msg(sender: str, group_name: str, body: str, system: bool = False) -> None:
+    ts = _timestamp()
+    with lock:
+        group = groups.get(group_name)
+        if group is None:
+            return
+        members = set(group["members"])
+        targets = [(u, s) for u, s in clients.items() if u in members]
+
+    if system:
+        payload = f"GROUP_MSG|[{ts}]|{group_name}|System|{body}"
+    else:
+        payload = f"GROUP_MSG|[{ts}]|{group_name}|{sender}|{body}"
+
+    for uname, sock in targets:
+        try:
+            _send_text(sock, payload)
+        except Exception:
+            pass
+
+    if not system:
+        _add_to_history(payload)
+        _log(f"  [GROUP:{group_name}] {sender}: {body}")
+        if on_message:
+            try:
+                on_message(f"[{group_name}] {sender}: {body}")
+            except Exception:
+                pass
+
+
+# ─────────────────────────────────────────────
+# Admin actions
+# ─────────────────────────────────────────────
+def kick_user(username: str) -> bool:
     with lock:
         sock = clients.pop(username, None)
-
     if sock is None:
-        return False  # user already gone
-
-    # Send the kick notice before closing
+        return False
     try:
-        sock.send(f"SYSTEM|[{_timestamp()}]|System|You have been kicked by the admin.".encode(ENCODING))
+        _send_text(sock, f"SYSTEM|[{_timestamp()}]|System|You have been kicked by the admin.")
     except Exception:
         pass
     try:
         sock.close()
     except Exception:
         pass
-
     _log(f"[KICK] {username} was kicked by admin")
-    broadcast(f"SYSTEM|[{_timestamp()}]|System|{username} was kicked by the admin.")
+    broadcast_text(f"SYSTEM|[{_timestamp()}]|System|{username} was kicked by the admin.")
     send_user_list()
-
     if on_user_leave is not None:
         try:
             on_user_leave(username)
         except Exception:
             pass
-
     return True
 
 
@@ -246,50 +411,52 @@ def kick_user(username: str) -> bool:
 # Client handler
 # ─────────────────────────────────────────────
 def handle_client(client_socket: socket.socket, address: tuple) -> None:
-    """Handle all I/O for a single connected client (runs in its own thread)."""
     username: Optional[str] = None
 
     try:
-        # ── Step 1: Receive username ──────────────
-        raw = client_socket.recv(BUFFER)
-        if not raw:
-            client_socket.close()
-            return
-        username = raw.decode(ENCODING).strip()
+        # Step 1: Receive username
+        _, _ = None, None
+        raw_len = _recv_exact(client_socket, 4)
+        if not raw_len:
+            client_socket.close(); return
+        msg_len = struct.unpack("!I", raw_len)[0]
+        raw_msg = _recv_exact(client_socket, msg_len)
+        if not raw_msg:
+            client_socket.close(); return
+        username = raw_msg.decode(ENCODING).strip()
 
-        # ── Step 2: Receive password ──────────────
-        raw = client_socket.recv(BUFFER)
-        if not raw:
-            client_socket.close()
-            return
-        password = raw.decode(ENCODING).strip()
+        # Step 2: Receive password
+        raw_len = _recv_exact(client_socket, 4)
+        if not raw_len:
+            client_socket.close(); return
+        msg_len = struct.unpack("!I", raw_len)[0]
+        raw_msg = _recv_exact(client_socket, msg_len)
+        if not raw_msg:
+            client_socket.close(); return
+        password = raw_msg.decode(ENCODING).strip()
 
-        # ── Step 3: Authenticate ──────────────────
+        # Step 3: Authenticate
         auth_result = _authenticate(username, password)
         if auth_result == "WRONG_PASS":
-            client_socket.send("ERROR:WRONG_PASS".encode(ENCODING))
+            _send_text(client_socket, "ERROR:WRONG_PASS")
             client_socket.close()
-            _log(f"[!] Wrong password for '{username}' from {address}")
             return
 
-        # ── Step 4: Check for duplicate login ─────
+        # Step 4: Check duplicate
         with lock:
             if username in clients:
-                client_socket.send("ERROR:USERNAME_TAKEN".encode(ENCODING))
+                _send_text(client_socket, "ERROR:USERNAME_TAKEN")
                 client_socket.close()
-                _log(f"[!] Rejected duplicate login: {username}")
                 return
             clients[username] = client_socket
 
         _log(f"[+] {username} connected from {address}")
-
         send_history(client_socket)
+        send_group_list(client_socket)
 
         ts = _timestamp()
-        broadcast(f"SYSTEM|[{ts}]|System|{username} has joined the chat! 👋", exclude=username)
-        client_socket.send(
-            f"SYSTEM|[{ts}]|System|Welcome to the chat, {username}!".encode(ENCODING)
-        )
+        broadcast_text(f"SYSTEM|[{ts}]|System|{username} has joined the chat! 👋", exclude=username)
+        _send_text(client_socket, f"SYSTEM|[{ts}]|System|Welcome to the chat, {username}! 🎉")
         send_user_list()
 
         if on_user_join is not None:
@@ -298,27 +465,63 @@ def handle_client(client_socket: socket.socket, address: tuple) -> None:
             except Exception:
                 pass
 
-        # ── Step 5: Main receive loop ─────────────
+        # Step 5: Main receive loop
         while True:
-            raw = client_socket.recv(BUFFER)
-            if not raw:
-                break  # client disconnected cleanly
+            header, data = recv_packet(client_socket)
+            if header is None:
+                break
 
-            message: str = raw.decode(ENCODING).strip()
+            message = header.strip()
             if not message:
                 continue
 
-            # ── Private message (@recipient body) ──
+            # ── File transfer ──────────────────────
+            if message.startswith("FILE_DATA|"):
+                # FILE_DATA|recipient|filename
+                parts = message.split("|", 3)
+                if len(parts) >= 3 and data is not None:
+                    _, recipient, filename = parts[0], parts[1], parts[2]
+                    is_group = recipient in groups
+                    _relay_file(username, recipient, filename, data, is_group=is_group)
+                continue
+
+            # ── Group commands ─────────────────────
+            if message.startswith("GROUP_CREATE|"):
+                group_name = message.removeprefix("GROUP_CREATE|").strip()
+                result = _create_group(username, group_name)
+                _send_text(client_socket, f"GROUP_RESULT|CREATE|{result}|{group_name}")
+                continue
+
+            if message.startswith("GROUP_JOIN|"):
+                group_name = message.removeprefix("GROUP_JOIN|").strip()
+                result = _join_group(username, group_name)
+                _send_text(client_socket, f"GROUP_RESULT|JOIN|{result}|{group_name}")
+                continue
+
+            if message.startswith("GROUP_LEAVE|"):
+                group_name = message.removeprefix("GROUP_LEAVE|").strip()
+                _leave_group(username, group_name)
+                continue
+
+            if message.startswith("GROUP_MSG|"):
+                # GROUP_MSG|group_name|body
+                parts = message.split("|", 2)
+                if len(parts) == 3:
+                    _, group_name, body = parts
+                    _send_group_msg(username, group_name, body)
+                continue
+
+            # ── Private message ────────────────────
             if message.startswith("@"):
                 parts = message.removeprefix("@").split(" ", 1)
                 if len(parts) == 2:
                     _send_private(username, parts[0], parts[1])
-                    continue
-                # malformed DM – fall through to broadcast
+                continue
 
+            # ── Broadcast message ──────────────────
             ts = _timestamp()
-            formatted_log = f"[{ts}] {username}: {message}"
             payload = f"MSG|[{ts}]|{username}|{message}"
+            formatted_log = f"[{ts}] {username}: {message}"
             _log(f"  [{address[0]}] {formatted_log}")
             _add_to_history(payload)
 
@@ -328,37 +531,28 @@ def handle_client(client_socket: socket.socket, address: tuple) -> None:
                 except Exception:
                     pass
 
-            # Echo back to sender + broadcast to others
-            try:
-                client_socket.send(payload.encode(ENCODING))
-            except Exception:
-                break
-            broadcast(payload, exclude=username)
+            _send_text(client_socket, payload)
+            broadcast_text(payload, exclude=username)
 
     except ConnectionResetError:
-        pass  # client disconnected abruptly — normal on Windows
+        pass
     except OSError:
-        pass  # socket closed externally (e.g. server stopped)
+        pass
     except Exception as e:
         _log(f"[!] Error with {username or address}: {e}")
     finally:
         if username is not None:
-            # Remove from dict only if we are still in it
-            # (kick_user may have already removed us)
             with lock:
                 clients.pop(username, None)
-
             _log(f"[-] {username} disconnected")
             ts = _timestamp()
-            broadcast(f"SYSTEM|[{ts}]|System|{username} has left the chat.")
+            broadcast_text(f"SYSTEM|[{ts}]|System|{username} has left the chat.")
             send_user_list()
-
             if on_user_leave is not None:
                 try:
                     on_user_leave(username)
                 except Exception:
                     pass
-
         try:
             client_socket.close()
         except Exception:
@@ -372,7 +566,6 @@ _server_socket: Optional[socket.socket] = None
 
 
 def start(host: str = HOST, port: int = PORT) -> None:
-    """Start the chat server (blocking call — run in a background thread)."""
     global _server_socket, _running
 
     _server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -384,17 +577,16 @@ def start(host: str = HOST, port: int = PORT) -> None:
         _log(f"[ERROR] Cannot bind to {host}:{port} — {e}")
         return
 
-    _server_socket.listen(10)
+    _server_socket.listen(20)
     _running = True
 
     _log("=" * 50)
-    _log("  Simple Chat Application - SERVER")
+    _log("  WhatsApp-like Chat Application - SERVER")
     _log("=" * 50)
     _log(f"  Listening on  : {host}:{port}")
     _log(f"  Buffer size   : {BUFFER} bytes")
+    _log(f"  Max file size : {MAX_FILE_SIZE // (1024*1024)} MB")
     _log(f"  History limit : {MAX_HISTORY} messages")
-    _log(f"  Users file    : {USERS_FILE}")
-    _log("  Press Ctrl+C to stop the server.")
     _log("=" * 50)
 
     try:
@@ -402,48 +594,36 @@ def start(host: str = HOST, port: int = PORT) -> None:
             try:
                 client_socket, address = _server_socket.accept()
             except OSError:
-                break  # socket was closed by stop()
-
-            t = threading.Thread(
-                target=handle_client,
-                args=(client_socket, address),
-                daemon=True,
-            )
+                break
+            t = threading.Thread(target=handle_client, args=(client_socket, address), daemon=True)
             t.start()
-            _log(f"[*] Active connections: {threading.active_count() - 1}")
-
     except KeyboardInterrupt:
-        _log("\n[!] Server shutting down (Ctrl+C)...")
+        _log("\n[!] Server shutting down...")
     finally:
         _cleanup()
 
 
 def stop() -> None:
-    """Stop the server gracefully (safe to call from any thread)."""
     global _running
     _running = False
-
     if _server_socket is not None:
         try:
             _server_socket.close()
         except Exception:
             pass
-
     _cleanup()
 
 
 def _cleanup() -> None:
-    """Disconnect all clients and clear state."""
     global _server_socket
     with lock:
         for sock in clients.values():
             try:
-                sock.send(f"SYSTEM|[{_timestamp()}]|System|Server is shutting down.".encode(ENCODING))
+                _send_text(sock, f"SYSTEM|[{_timestamp()}]|System|Server is shutting down.")
                 sock.close()
             except Exception:
                 pass
         clients.clear()
-
     _server_socket = None
 
 
