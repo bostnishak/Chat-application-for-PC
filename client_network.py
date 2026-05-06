@@ -1,41 +1,32 @@
-"""
-Low-level networking helpers shared by client_gui and test_chat.
-Uses length-prefixed binary protocol matching server.py.
-"""
-
-import socket
-import struct
-import threading
-from typing import Optional, Callable
+"""Network helpers shared by client GUI."""
+import socket, struct
+from typing import Optional, Tuple
 
 ENCODING = "utf-8"
 
 
-def send_text(sock: socket.socket, message: str) -> bool:
-    """Send a length-prefixed text message."""
+def send_text(sock: socket.socket, msg: str) -> bool:
     try:
-        encoded = message.encode(ENCODING)
-        header = struct.pack("!I", len(encoded))
-        sock.sendall(header + encoded)
+        enc = msg.encode(ENCODING)
+        sock.sendall(struct.pack("!I", len(enc)) + enc)
         return True
     except Exception:
         return False
 
 
-def send_binary(sock: socket.socket, header_text: str, data: bytes) -> bool:
-    """Send binary packet: 4-byte text-len + text + 4-byte data-len + data."""
+def send_binary(sock: socket.socket, header: str, data: bytes) -> bool:
     try:
-        hdr_enc = header_text.encode(ENCODING)
-        packet = (struct.pack("!I", len(hdr_enc)) + hdr_enc +
-                  struct.pack("!I", len(data)) + data)
-        sock.sendall(packet)
+        hdr_enc = header.encode(ENCODING)
+        sock.sendall(
+            struct.pack("!I", len(hdr_enc)) + hdr_enc +
+            struct.pack("!I", len(data)) + data
+        )
         return True
     except Exception:
         return False
 
 
 def recv_exact(sock: socket.socket, n: int) -> Optional[bytes]:
-    """Receive exactly n bytes."""
     buf = b""
     while len(buf) < n:
         chunk = sock.recv(n - len(buf))
@@ -45,39 +36,37 @@ def recv_exact(sock: socket.socket, n: int) -> Optional[bytes]:
     return buf
 
 
-def recv_packet(sock: socket.socket):
-    """
-    Receive one packet. Returns (header_str, binary_data_or_None).
-    """
-    raw_len = recv_exact(sock, 4)
-    if raw_len is None:
+def recv_packet(sock: socket.socket) -> Tuple[Optional[str], Optional[bytes]]:
+    """Returns (header_str, binary_data_or_None)."""
+    raw = recv_exact(sock, 4)
+    if not raw:
         return None, None
-    msg_len = struct.unpack("!I", raw_len)[0]
-    raw_msg = recv_exact(sock, msg_len)
-    if raw_msg is None:
+    raw_msg = recv_exact(sock, struct.unpack("!I", raw)[0])
+    if not raw_msg:
         return None, None
     header = raw_msg.decode(ENCODING)
-
     if header.startswith("FILE_DATA|") or header.startswith("FILE_SENT|"):
         raw_dlen = recv_exact(sock, 4)
-        if raw_dlen is None:
+        if not raw_dlen:
             return header, None
         dlen = struct.unpack("!I", raw_dlen)[0]
         data = recv_exact(sock, dlen)
         return header, data
-
     return header, None
 
 
-def connect_and_login(host: str, port: int, action: str, username: str, password: str):
-    """
-    Connect to server, send action, credentials, return (socket, first_message) or raise.
-    """
+def connect_and_login(
+    host: str, port: int, action: str, username: str, password: str
+) -> Tuple[socket.socket, str]:
+    """Connect, authenticate, return (socket, first_packet). Raises on failure."""
+    import time
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(8)
     sock.connect((host, port))
+    sock.settimeout(None)
 
     send_text(sock, action)
-    import time; time.sleep(0.05)
+    time.sleep(0.05)
     send_text(sock, username)
     time.sleep(0.05)
     send_text(sock, password)
@@ -86,17 +75,16 @@ def connect_and_login(host: str, port: int, action: str, username: str, password
     if header is None:
         sock.close()
         raise ConnectionError("Server did not respond.")
-    if header.startswith("ERROR:USERNAME_TAKEN"):
-        sock.close()
-        raise PermissionError("USERNAME_TAKEN")
-    if header.startswith("ERROR:WRONG_PASS"):
-        sock.close()
-        raise PermissionError("WRONG_PASS")
-    if header.startswith("ERROR:NOT_FOUND"):
-        sock.close()
-        raise PermissionError("NOT_FOUND")
-    if header.startswith("ERROR:ALREADY_EXISTS"):
-        sock.close()
-        raise PermissionError("ALREADY_EXISTS")
+
+    err_map = {
+        "ERROR:NOT_FOUND": "NOT_FOUND",
+        "ERROR:WRONG_PASS": "WRONG_PASS",
+        "ERROR:USERNAME_TAKEN": "USERNAME_TAKEN",
+        "ERROR:ALREADY_EXISTS": "ALREADY_EXISTS",
+    }
+    for prefix, code in err_map.items():
+        if header.startswith(prefix):
+            sock.close()
+            raise PermissionError(code)
 
     return sock, header

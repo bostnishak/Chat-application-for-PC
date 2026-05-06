@@ -1,580 +1,765 @@
-"""
-Modern ChatWindow using CustomTkinter.
-Supports Image inline viewing, Voice messages, separate chat instances.
-"""
+"""Chat Window — WhatsApp-style, pure tkinter."""
+import io, json, os, struct, threading, time, tkinter as tk
+from tkinter import filedialog, messagebox, scrolledtext
+from client_network import send_text, send_binary, recv_packet
 
-import socket
-import threading
-import json
-import time
-import io
-import os
-import struct
-import tkinter as tk
-from tkinter import filedialog, messagebox
-import customtkinter as ctk
-from PIL import Image
-import sounddevice as sd
-import soundfile as sf
-import numpy as np
+# ── Palette (Navy / Dark-Blue theme) ─────────────────────────────────────────
+BG       = "#080d1a"   # deepest navy
+PANEL    = "#0d1429"   # sidebar / header
+CARD     = "#111d38"   # cards, bubbles
+ACCENT   = "#3d7ae5"   # primary blue
+ACCENT2  = "#5865f2"   # blurple (active chat / send btn)
+TEXT     = "#dce6f5"   # main text
+DIM      = "#7a8ba8"   # secondary text
+INPUT_BG = "#080d1a"
+BORDER   = "#1e3059"   # subtle navy border
+OWN_BG   = "#1e3a6e"   # OWN message bubble — dark blue
+OTH_BG   = "#111d38"   # OTHER message bubble — navy
+SYS_FG   = "#6a7d9e"
+RED      = "#da3633"
+GOLD     = "#e3b341"
+PREVIEW_BG = "#0d1e40" # file/voice action bar
 
-from client_network import send_text, send_file, recv_packet
+FONT       = ("Segoe UI", 11)
+FONT_BOLD  = ("Segoe UI", 11, "bold")
+FONT_SMALL = ("Segoe UI", 9)
+FONT_TIME  = ("Segoe UI", 8)
+FONT_EMOJI = ("Segoe UI Emoji", 18)
 
-# ─────────────────────────────────────────────
-# Colors & Styles
-# ─────────────────────────────────────────────
-BG_SIDEBAR = "#1f2326"
-BG_MAIN = "#14171a"
-BG_HEADER = "#1f2326"
-BG_BUBBLE_OWN = "#2b5278"
-BG_BUBBLE_OTHER = "#2b2d31"
-TEXT_COLOR = "#ffffff"
-TEXT_DIM = "#99aab5"
-ACCENT = "#5865F2"  # Discord-like blurple
-
-ctk.set_appearance_mode("Dark")
+EMOJIS = ["😀","😂","😍","🥰","😎","😊","🤔","😅","🤩","😏",
+          "👍","👎","❤️","🔥","✅","🎉","😢","😡","🙄","💀",
+          "🙏","💪","👏","🤝","💬","📎","🎵","🚀","⭐","💯"]
 
 
 class ChatWindow:
-    def __init__(self, root: ctk.CTk, sock: socket.socket, username: str, init_history: str):
-        self.root = root
-        self.sock = sock
-        self.username = username
-        self.running = True
+    def __init__(self, root, sock, username: str, init_msg: str):
+        self.root      = root
+        self.sock      = sock
+        self.username  = username
+        self.running   = True
+        self.users     = []
+        self.groups    = []
+        self.unread    = {}
+        self.active    = "Global"
+        self.panels    = {}
+        self.sidebar_btns = {}
+        self._pending_file = None       # (filename, bytes)
+        self._recording    = False
+        self._audio_frames = []
+        self._audio_stream = None
+        self._rec_seconds  = 0          # live timer counter
+        self._emoji_imgs   = {}         # cache: char -> PhotoImage
 
-        # State
-        self.users = []
-        self.groups = []
-        self.unread = {}
-        self.active_chat = "Global"
-
-        # Chat Frames: mapping chat_id -> ctk.CTkScrollableFrame
-        self.chat_frames = {}
-
-        # Audio recording state
-        self.is_recording = False
-        self.audio_stream = None
-        self.audio_frames = []
-
-        # Setup main window
-        self.window = ctk.CTkToplevel(self.root)
-        self.window.title(f"Chat App - {self.username}")
-        self.window.geometry("1100x700")
-        self.window.configure(fg_color=BG_MAIN)
-        self.window.protocol("WM_DELETE_WINDOW", self._on_close)
-
-        # Center
-        self.window.update_idletasks()
-        sw = self.window.winfo_screenwidth()
-        sh = self.window.winfo_screenheight()
-        x = (sw - 1100) // 2
-        y = (sh - 700) // 2
-        self.window.geometry(f"+{x}+{y}")
+        self.win = tk.Toplevel(root)
+        self.win.title(f"Chat App — {username}")
+        self.win.configure(bg=BG)
+        self.win.protocol("WM_DELETE_WINDOW", self._close)
+        self._center(1150, 720)
 
         self._build_ui()
-        self._create_chat_frame("Global")
+        self._switch("Global")
+        self._dispatch(init_msg, None)
 
-        # Process initial history
-        if init_history:
-            for packet in init_history.split("\n"):
-                if packet:
-                    self._dispatch(packet, None)
+        threading.Thread(target=self._recv_loop, daemon=True).start()
 
-        # Start recv thread
-        self.recv_thread = threading.Thread(target=self._recv_loop, daemon=True)
-        self.recv_thread.start()
+    # ── Layout ────────────────────────────────────────────────────────────────
+    def _center(self, w, h):
+        self.win.update_idletasks()
+        sw, sh = self.win.winfo_screenwidth(), self.win.winfo_screenheight()
+        self.win.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
 
-    # ── UI BUILDING ──────────────────────────────────────────────
     def _build_ui(self):
-        # Base grid layout: Sidebar (250px) | Main Chat Area
-        self.window.grid_columnconfigure(1, weight=1)
-        self.window.grid_rowconfigure(0, weight=1)
+        self.win.grid_columnconfigure(1, weight=1)
+        self.win.grid_rowconfigure(0, weight=1)
 
-        # ── SIDEBAR ──
-        self.sidebar = ctk.CTkFrame(self.window, width=260, corner_radius=0, fg_color=BG_SIDEBAR)
-        self.sidebar.grid(row=0, column=0, sticky="nsew")
-        self.sidebar.grid_rowconfigure(2, weight=1)  # the list area expands
+        # ── Sidebar ────────────────────────────────────────────────────────
+        sb = tk.Frame(self.win, bg=PANEL, width=250)
+        sb.grid(row=0, column=0, sticky="nsew")
+        sb.grid_propagate(False)
+        sb.grid_rowconfigure(1, weight=1)
 
-        # Sidebar Header (User Info)
-        hdr_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
-        hdr_frame.grid(row=0, column=0, sticky="ew", padx=15, pady=(20, 10))
-        
-        ctk.CTkLabel(hdr_frame, text=f"👤 {self.username}", font=ctk.CTkFont(size=18, weight="bold")).pack(side="left")
+        # sidebar header
+        hdr = tk.Frame(sb, bg=PANEL, pady=14, padx=14)
+        hdr.grid(row=0, column=0, sticky="ew")
+        tk.Label(hdr, text=f"👤 {self.username}", font=FONT_BOLD,
+                 fg=TEXT, bg=PANEL).pack(side="left")
 
-        # Sidebar Search
-        self.search_entry = ctk.CTkEntry(self.sidebar, placeholder_text="Search...", height=35, corner_radius=8)
-        self.search_entry.grid(row=1, column=0, sticky="ew", padx=15, pady=10)
-        self.search_entry.bind("<KeyRelease>", self._on_search)
+        # contact list
+        self.sb_list = tk.Frame(sb, bg=PANEL)
+        self.sb_list.grid(row=1, column=0, sticky="nsew")
 
-        # Sidebar Contact List
-        self.contact_list_frame = ctk.CTkScrollableFrame(self.sidebar, fg_color="transparent")
-        self.contact_list_frame.grid(row=2, column=0, sticky="nsew", padx=5)
+        # sidebar footer (new-group / join)
+        ftr = tk.Frame(sb, bg=PANEL, pady=10, padx=10)
+        ftr.grid(row=2, column=0, sticky="ew")
+        tk.Button(ftr, text="➕ New Group", font=FONT_SMALL, bg=ACCENT,
+                  fg=TEXT, relief="flat", cursor="hand2", padx=8, pady=5,
+                  command=self._new_group).pack(side="left", fill="x", expand=True, padx=(0,4))
+        tk.Button(ftr, text="🔗 Join", font=FONT_SMALL, bg=ACCENT2,
+                  fg=TEXT, relief="flat", cursor="hand2", padx=8, pady=5,
+                  command=self._join_group).pack(side="right", fill="x", expand=True, padx=(4,0))
 
-        # Sidebar Footer (Groups)
-        ftr_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
-        ftr_frame.grid(row=3, column=0, sticky="ew", padx=15, pady=15)
-        
-        btn_new_group = ctk.CTkButton(ftr_frame, text="➕ New Group", width=110, fg_color="#4CAF50", hover_color="#45a049", command=self._prompt_create_group)
-        btn_new_group.pack(side="left", fill="x", expand=True, padx=(0, 5))
-        
-        btn_join_group = ctk.CTkButton(ftr_frame, text="🔗 Join", width=110, fg_color="#2196F3", hover_color="#1E88E5", command=self._prompt_join_group)
-        btn_join_group.pack(side="right", fill="x", expand=True, padx=(5, 0))
+        # ── Right (header + chat area + input) ───────────────────────────
+        right = tk.Frame(self.win, bg=BG)
+        right.grid(row=0, column=1, sticky="nsew")
+        right.grid_rowconfigure(1, weight=1)
+        right.grid_columnconfigure(0, weight=1)
 
-        # ── MAIN CHAT AREA ──
-        self.main_area = ctk.CTkFrame(self.window, corner_radius=0, fg_color=BG_MAIN)
-        self.main_area.grid(row=0, column=1, sticky="nsew")
-        self.main_area.grid_rowconfigure(1, weight=1)
-        self.main_area.grid_columnconfigure(0, weight=1)
+        # chat header
+        self.chat_hdr = tk.Frame(right, bg=PANEL, pady=12, padx=16)
+        self.chat_hdr.grid(row=0, column=0, sticky="ew")
+        self.chat_title = tk.Label(self.chat_hdr, text="🌐 Global",
+                                   font=FONT_BOLD, fg=TEXT, bg=PANEL)
+        self.chat_title.pack(side="left")
+        self.leave_btn = tk.Button(self.chat_hdr, text="🚪 Leave", font=FONT_SMALL,
+                                   bg=RED, fg=TEXT, relief="flat", cursor="hand2",
+                                   padx=8, pady=4, command=self._leave_group)
+        # leave_btn hidden by default
 
-        # Chat Header
-        self.chat_header = ctk.CTkFrame(self.main_area, height=60, corner_radius=0, fg_color=BG_HEADER)
-        self.chat_header.grid(row=0, column=0, sticky="ew")
-        self.chat_header.pack_propagate(False)
+        # chat container (panels stack here)
+        self.chat_area = tk.Frame(right, bg=BG)
+        self.chat_area.grid(row=1, column=0, sticky="nsew")
 
-        self.chat_title_lbl = ctk.CTkLabel(self.chat_header, text="🌐 Global", font=ctk.CTkFont(size=18, weight="bold"))
-        self.chat_title_lbl.pack(side="left", padx=20)
-        
-        self.leave_btn = ctk.CTkButton(self.chat_header, text="🚪 Leave Group", width=100, fg_color="#F44336", hover_color="#D32F2F", command=self._leave_group)
-        self.leave_btn.pack(side="right", padx=20)
-        self.leave_btn.pack_forget()  # Hidden initially
+        # ── File preview bar (row=2, hidden by default) ──────────────────────
+        self.preview_bar = tk.Frame(right, bg=PREVIEW_BG, pady=5, padx=10)
+        # NOT gridded until a file is selected
+        self.preview_thumb = tk.Label(self.preview_bar, bg=PREVIEW_BG)
+        self.preview_thumb.pack(side="left", padx=(0, 8))
+        self.preview_lbl = tk.Label(self.preview_bar, text="", font=FONT_SMALL,
+                                    fg=TEXT, bg=PREVIEW_BG, anchor="w")
+        self.preview_lbl.pack(side="left", fill="x", expand=True)
+        tk.Button(self.preview_bar, text="✖", font=FONT_SMALL,
+                  bg=RED, fg=TEXT, relief="flat", cursor="hand2", padx=8, pady=3,
+                  command=self._cancel_file).pack(side="right", padx=(6, 0))
+        tk.Button(self.preview_bar, text="  📤 Send  ", font=FONT_BOLD,
+                  bg=ACCENT, fg=TEXT, relief="flat", cursor="hand2", padx=10, pady=4,
+                  command=self._send_pending_file).pack(side="right")
 
-        # Chat History Container (where the separate scrollable frames will be placed)
-        self.history_container = ctk.CTkFrame(self.main_area, fg_color="transparent")
-        self.history_container.grid(row=1, column=0, sticky="nsew")
+        # ── Voice timer bar (row=2, hidden by default) ─────────────────
+        self.voice_bar = tk.Frame(right, bg="#1a1040", pady=5, padx=10)
+        # NOT gridded until recording starts
+        tk.Label(self.voice_bar, text="🔴  Recording...", font=FONT_BOLD,
+                 fg="#a090ff", bg="#1a1040").pack(side="left")
+        self.voice_timer_lbl = tk.Label(self.voice_bar, text="0:00",
+                                        font=FONT_BOLD, fg=TEXT, bg="#1a1040")
+        self.voice_timer_lbl.pack(side="left", padx=(10, 0))
+        tk.Button(self.voice_bar, text="  📤 Send  ", font=FONT_BOLD,
+                  bg="#3d2a8a", fg=TEXT, relief="flat", cursor="hand2", padx=10, pady=4,
+                  command=self._voice_stop_send).pack(side="right")
+        tk.Button(self.voice_bar, text="✖ Cancel", font=FONT_SMALL,
+                  bg="#120e2e", fg="#a090ff", relief="flat", cursor="hand2", padx=6, pady=3,
+                  command=self._voice_cancel).pack(side="right", padx=(0, 6))
 
-        # Input Area
-        self.input_area = ctk.CTkFrame(self.main_area, height=70, corner_radius=0, fg_color=BG_HEADER)
-        self.input_area.grid(row=2, column=0, sticky="ew")
-        self.input_area.grid_columnconfigure(2, weight=1)
+        # ── Input bar (row=3) ────────────────────────────────────────
+        inp = tk.Frame(right, bg=PANEL, pady=8, padx=10)
+        inp.grid(row=3, column=0, sticky="ew")
+        inp.grid_columnconfigure(2, weight=1)
 
-        # Attachment Button
-        self.btn_attach = ctk.CTkButton(self.input_area, text="📎", width=40, height=40, font=ctk.CTkFont(size=20), fg_color="transparent", hover_color=BG_BUBBLE_OTHER, command=self._send_file)
-        self.btn_attach.grid(row=0, column=0, padx=(15, 5), pady=15)
+        tk.Button(inp, text="📎", font=("Segoe UI Emoji", 16),
+                  bg=PANEL, fg=TEXT, relief="flat", cursor="hand2",
+                  command=self._pick_file).grid(row=0, column=0, padx=(0,4))
+        tk.Button(inp, text="😊", font=("Segoe UI Emoji", 16),
+                  bg=PANEL, fg=TEXT, relief="flat", cursor="hand2",
+                  command=self._emoji_picker).grid(row=0, column=1, padx=(0,6))
 
-        # Emoji Button
-        self.btn_emoji = ctk.CTkButton(self.input_area, text="😊", width=40, height=40, font=ctk.CTkFont(size=20), fg_color="transparent", hover_color=BG_BUBBLE_OTHER, command=self._show_emoji_picker)
-        self.btn_emoji.grid(row=0, column=1, padx=5, pady=15)
+        self.input_var = tk.StringVar()
+        self.input_box = tk.Entry(inp, textvariable=self.input_var,
+                                  font=FONT, bg=INPUT_BG, fg=TEXT,
+                                  insertbackground=TEXT, relief="flat",
+                                  highlightthickness=1,
+                                  highlightbackground=BORDER,
+                                  highlightcolor=ACCENT2, bd=6)
+        self.input_box.grid(row=0, column=2, sticky="ew", ipady=8)
+        self.input_box.bind("<Return>", lambda e: self._send_msg())
 
-        # Text Input
-        self.input_entry = ctk.CTkEntry(self.input_area, placeholder_text="Type a message...", height=40, corner_radius=20, font=ctk.CTkFont(size=14))
-        self.input_entry.grid(row=0, column=2, sticky="ew", padx=10, pady=15)
-        self.input_entry.bind("<Return>", lambda e: self._send_text_message())
+        send_btn = tk.Button(inp, text="Send ▶", font=FONT_BOLD,
+                             bg=ACCENT2, fg=TEXT, relief="flat",
+                             cursor="hand2", padx=14, pady=6,
+                             command=self._send_msg)
+        send_btn.grid(row=0, column=3, padx=(6, 0))
 
-        # Voice Record Button
-        self.btn_voice = ctk.CTkButton(self.input_area, text="🎤", width=40, height=40, font=ctk.CTkFont(size=20), fg_color="transparent", hover_color="#f44336")
-        self.btn_voice.grid(row=0, column=3, padx=(5, 15), pady=15)
-        self.btn_voice.bind("<ButtonPress-1>", self._start_voice_record)
-        self.btn_voice.bind("<ButtonRelease-1>", self._stop_voice_record)
+        # Voice button — click to START, click again to STOP+send
+        self.voice_btn = tk.Button(inp, text="🎤", font=("Segoe UI Emoji", 16),
+                                   bg=PANEL, fg=TEXT, relief="flat",
+                                   cursor="hand2", command=self._voice_toggle)
+        self.voice_btn.grid(row=0, column=4, padx=(4, 0))
 
-    def _create_chat_frame(self, chat_id: str):
-        if chat_id not in self.chat_frames:
-            frame = ctk.CTkScrollableFrame(self.history_container, fg_color="transparent")
-            self.chat_frames[chat_id] = frame
-        return self.chat_frames[chat_id]
+    # ── Sidebar helpers ───────────────────────────────────────────────────────
+    def _rebuild_sidebar(self):
+        for w in self.sb_list.winfo_children():
+            w.destroy()
+        self.sidebar_btns.clear()
 
-    def _switch_chat(self, chat_id: str):
-        # Hide current
-        if self.active_chat in self.chat_frames:
-            self.chat_frames[self.active_chat].pack_forget()
+        def _add(chat_id, icon):
+            unread = self.unread.get(chat_id, 0)
+            active = (chat_id == self.active)
+            bg = ACCENT2 if active else PANEL
+            fg = TEXT
+            label = f"{icon} {chat_id}" + (f"  [{unread}]" if unread and not active else "")
+            btn = tk.Button(self.sb_list, text=label, font=FONT,
+                            bg=bg, fg=fg, relief="flat", anchor="w",
+                            cursor="hand2", pady=10, padx=14,
+                            command=lambda c=chat_id: self._switch(c))
+            btn.pack(fill="x")
+            self.sidebar_btns[chat_id] = btn
 
-        self.active_chat = chat_id
-        
-        # Reset unread
-        if chat_id in self.unread:
-            self.unread[chat_id] = 0
-            self._rebuild_conv_list()
+        _add("Global", "🌐")
 
-        # Update Header
-        prefix = "🌐" if chat_id == "Global" else "👤"
+        if self.groups:
+            tk.Label(self.sb_list, text="GROUPS", font=FONT_SMALL,
+                     fg=DIM, bg=PANEL, anchor="w", padx=14).pack(fill="x", pady=(10, 2))
+            for g in sorted(self.groups):
+                _add(g, "👥")
+
+        others = [u for u in self.users if u != self.username]
+        if others:
+            tk.Label(self.sb_list, text="DIRECT MESSAGES", font=FONT_SMALL,
+                     fg=DIM, bg=PANEL, anchor="w", padx=14).pack(fill="x", pady=(10, 2))
+            for u in sorted(others):
+                _add(u, "👤")
+
+    # ── Chat panels ───────────────────────────────────────────────────────────
+    def _get_panel(self, chat_id: str) -> tk.Frame:
+        if chat_id not in self.panels:
+            f = tk.Frame(self.chat_area, bg=BG)
+            # inner scrollable via canvas
+            canvas = tk.Canvas(f, bg=BG, highlightthickness=0)
+            sb = tk.Scrollbar(f, orient="vertical", command=canvas.yview)
+            canvas.configure(yscrollcommand=sb.set)
+            sb.pack(side="right", fill="y")
+            canvas.pack(side="left", fill="both", expand=True)
+            inner = tk.Frame(canvas, bg=BG)
+            win_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+            def _resize(e, cv=canvas, wid=win_id):
+                cv.itemconfig(wid, width=cv.winfo_width())
+            canvas.bind("<Configure>", _resize)
+
+            def _scroll(e, cv=canvas):
+                cv.yview_moveto(1.0)
+            inner.bind("<Configure>", lambda e, cv=canvas: (
+                cv.configure(scrollregion=cv.bbox("all")),
+                cv.yview_moveto(1.0)
+            ))
+            self.panels[chat_id] = (f, inner, canvas)
+        return self.panels[chat_id]
+
+    def _switch(self, chat_id: str):
+        # hide current
+        if self.active in self.panels:
+            self.panels[self.active][0].pack_forget()
+
+        self.active = chat_id
+        self.unread[chat_id] = 0
+
+        # update header
+        icon = "🌐" if chat_id == "Global" else ("👥" if chat_id in self.groups else "👤")
+        self.chat_title.config(text=f"{icon} {chat_id}")
+
+        # show / hide leave button
         if chat_id in self.groups:
-            prefix = "👥"
-            self.leave_btn.pack(side="right", padx=20)
+            self.leave_btn.pack(side="right")
         else:
             self.leave_btn.pack_forget()
 
-        self.chat_title_lbl.configure(text=f"{prefix} {chat_id}")
+        # show panel
+        frame, inner, canvas = self._get_panel(chat_id)
+        frame.pack(fill="both", expand=True)
+        self.win.after(50, lambda: canvas.yview_moveto(1.0))
 
-        # Show new frame
-        frame = self._create_chat_frame(chat_id)
-        frame.pack(fill="both", expand=True, padx=10, pady=10)
+        self._rebuild_sidebar()
 
-        # Scroll to bottom
-        frame._parent_canvas.yview_moveto(1.0)
+    # ── Bubble rendering ──────────────────────────────────────────────────────
+    def _bubble(self, chat_id: str, ts: str, sender: str, body: str,
+                own: bool = False, is_system: bool = False,
+                image=None, audio_data: bytes = None,
+                file_name: str = None, file_data: bytes = None):
 
-    # ── CONTACT LIST LOGIC ──────────────────────────────────────
-    def _on_search(self, event=None):
-        self._rebuild_conv_list()
+        _, inner, canvas = self._get_panel(chat_id)
 
-    def _rebuild_conv_list(self):
-        query = self.search_entry.get().lower()
+        row = tk.Frame(inner, bg=BG)
+        row.pack(fill="x", padx=8, pady=4)
 
-        # Clear existing
-        for widget in self.contact_list_frame.winfo_children():
-            widget.destroy()
+        if is_system:
+            tk.Label(row, text=f"── {body} ──", font=FONT_SMALL,
+                     fg=SYS_FG, bg=BG).pack()
+            if self.active != chat_id:
+                self.unread[chat_id] = self.unread.get(chat_id, 0) + 1
+                self._rebuild_sidebar()
+            return
 
-        def add_item(name, icon):
-            if query and query not in name.lower():
-                return
-            
-            bg = ACCENT if name == self.active_chat else "transparent"
-            hover = ACCENT if name == self.active_chat else BG_MAIN
-            
-            btn = ctk.CTkButton(self.contact_list_frame, text=f"{icon} {name}", anchor="w", fg_color=bg, hover_color=hover, font=ctk.CTkFont(size=14), command=lambda n=name: self._switch_chat(n))
-            btn.pack(fill="x", pady=2, ipady=4)
+        anchor = "e" if own else "w"
+        bub_bg = OWN_BG if own else OTH_BG
 
-            # Add unread badge if needed
-            unread_count = self.unread.get(name, 0)
-            if unread_count > 0 and name != self.active_chat:
-                badge = ctk.CTkLabel(btn, text=str(unread_count), fg_color="#F44336", text_color="white", corner_radius=10, width=20, height=20, font=ctk.CTkFont(size=11, weight="bold"))
-                badge.place(relx=0.9, rely=0.5, anchor="center")
+        bubble = tk.Frame(row, bg=bub_bg, padx=10, pady=6)
+        bubble.pack(anchor=anchor, padx=4)
 
-        add_item("Global", "🌐")
-        
-        if self.groups:
-            ctk.CTkLabel(self.contact_list_frame, text="GROUPS", font=ctk.CTkFont(size=11, weight="bold"), text_color=TEXT_DIM).pack(anchor="w", pady=(10, 0), padx=5)
-            for g in sorted(self.groups):
-                add_item(g, "👥")
+        if not own:
+            tk.Label(bubble, text=sender, font=FONT_BOLD,
+                     fg=ACCENT2, bg=bub_bg).pack(anchor="w")
 
-        users_list = [u for u in self.users if u != self.username]
-        if users_list:
-            ctk.CTkLabel(self.contact_list_frame, text="DIRECT MESSAGES", font=ctk.CTkFont(size=11, weight="bold"), text_color=TEXT_DIM).pack(anchor="w", pady=(10, 0), padx=5)
-            for u in sorted(users_list):
-                add_item(u, "👤")
+        if image is not None:
+            tk.Label(bubble, image=image, bg=bub_bg).pack(anchor="w")
+            bubble._img_ref = image  # keep ref
 
-    # ── NETWORK RECEIVE LOOP ─────────────────────────────────────
+        elif audio_data is not None:
+            af = tk.Frame(bubble, bg=bub_bg)
+            af.pack(anchor="w")
+            tk.Label(af, text="🎵 Voice message", font=FONT, fg=TEXT, bg=bub_bg).pack(side="left")
+            captured = audio_data
+            tk.Button(af, text="▶ Play", font=FONT_SMALL, bg=CARD, fg=TEXT,
+                      relief="flat", cursor="hand2", padx=6,
+                      command=lambda d=captured: self._play_audio(d)).pack(side="left", padx=(8,0))
+
+        elif file_data is not None and file_name is not None:
+            ff = tk.Frame(bubble, bg=bub_bg)
+            ff.pack(anchor="w")
+            kb = len(file_data) / 1024
+            tk.Label(ff, text=f"📄 {file_name} ({kb:.1f} KB)",
+                     font=FONT, fg=TEXT, bg=bub_bg).pack(side="left")
+            tk.Button(ff, text="💾 Save", font=FONT_SMALL, bg=CARD, fg=TEXT,
+                      relief="flat", cursor="hand2", padx=6,
+                      command=lambda n=file_name, d=file_data: self._save_file(n, d)
+                      ).pack(side="left", padx=(8,0))
+        else:
+            tk.Label(bubble, text=body, font=FONT, fg=TEXT,
+                     bg=bub_bg, wraplength=500, justify="left").pack(anchor="w")
+
+        tk.Label(bubble, text=ts, font=FONT_TIME, fg=DIM, bg=bub_bg).pack(anchor="e")
+
+        if self.active != chat_id and not own:
+            self.unread[chat_id] = self.unread.get(chat_id, 0) + 1
+            self._rebuild_sidebar()
+        elif self.active == chat_id:
+            self.win.after(30, lambda: canvas.yview_moveto(1.0))
+
+    # ── Network dispatch ──────────────────────────────────────────────────────
     def _recv_loop(self):
         while self.running:
             try:
                 hdr, data = recv_packet(self.sock)
                 if hdr is None:
                     break
-                msg = hdr.strip()
-                if msg:
-                    self.window.after(0, self._dispatch, msg, data)
-            except Exception as e:
-                print("Recv loop error:", e)
+                self.win.after(0, self._dispatch, hdr.strip(), data)
+            except Exception:
                 break
         if self.running:
-            self.window.after(0, self._connection_lost)
+            self.win.after(0, self._disconnected)
 
-    def _connection_lost(self):
-        self.running = False
-        messagebox.showerror("Disconnected", "Server closed the connection.", parent=self.window)
-        self.window.destroy()
-        self.root.destroy()
-
-    def _dispatch(self, message: str, binary_data: bytes = None):
-        parts = message.split("|")
+    def _dispatch(self, msg: str, data: bytes):
+        if not msg:
+            return
+        parts = msg.split("|")
         ptype = parts[0]
 
-        if ptype == "MSG":
+        if ptype in ("MSG", "HISTORY"):
             # MSG|[ts]|sender|body
+            if len(parts) < 4:
+                return
             ts, sender, body = parts[1], parts[2], "|".join(parts[3:])
             own = (sender == self.username)
-            self._handle_msg("Global", ts, sender, body, own)
+            self._bubble("Global", ts, sender, body, own=own)
 
         elif ptype == "DM":
-            # DM|[ts]|sender|body
             ts, sender, body = parts[1], parts[2], "|".join(parts[3:])
-            self._handle_msg(sender, ts, sender, body, own=False)
+            self._bubble(sender, ts, sender, body, own=False)
 
         elif ptype == "DM_SENT":
             ts, recip, body = parts[1], parts[2], "|".join(parts[3:])
-            self._handle_msg(recip, ts, "You", body, own=True)
+            self._bubble(recip, ts, "You", body, own=True)
 
         elif ptype == "GROUP_MSG":
+            if len(parts) < 5:
+                return
             ts, group, sender, body = parts[1], parts[2], parts[3], "|".join(parts[4:])
             own = (sender == self.username)
-            display_sender = "You" if own else sender
-            self._handle_msg(group, ts, display_sender, body, own=own)
+            self._bubble(group, ts, sender, body, own=own)
 
-        elif ptype == "FILE_DATA":
-            # FILE_DATA|[ts]|sender|recip|filename|size
-            ts, sender, recip, filename = parts[1], parts[2], parts[3], parts[4]
-            is_group = recip in self.groups
-            chat_id = recip if is_group else (sender if sender != self.username else recip)
-            own = (sender == self.username)
-            display_sender = "You" if own else sender
-            self._handle_file(chat_id, ts, display_sender, filename, binary_data, own)
+        elif ptype in ("SYSTEM", "ANNOUNCE"):
+            ts, body = parts[1], "|".join(parts[3:])
+            self._bubble("Global", ts, "System", body, is_system=True)
 
-        elif ptype == "SYSTEM" or ptype == "ANNOUNCE":
-            ts, sender, body = parts[1], parts[2], "|".join(parts[3:])
-            self._handle_msg("Global", ts, sender, body, own=False, is_system=True)
+        elif ptype == "GROUP_INVITE":
+            ts, gname, inviter = parts[1], parts[2], parts[3]
+            if gname not in self.groups:
+                self.groups.append(gname)
+                self._rebuild_sidebar()
+            self._bubble("Global", ts, "System",
+                         f"You were added to group '{gname}' by {inviter}.", is_system=True)
 
         elif ptype == "USERLIST":
-            users = parts[1].split(",") if len(parts) > 1 and parts[1] else []
-            self.users = users
-            self._rebuild_conv_list()
+            self.users = parts[1].split(",") if len(parts) > 1 and parts[1] else []
+            self._rebuild_sidebar()
 
         elif ptype == "GROUPLIST":
             if len(parts) > 1 and parts[1]:
                 try:
-                    data = json.loads(parts[1])
-                    self.groups = [g for g, d in data.items() if self.username in d.get("members", [])]
+                    gdata = json.loads(parts[1])
+                    self.groups = [
+                        g for g, d in gdata.items()
+                        if self.username in d.get("members", [])
+                    ]
                 except Exception:
                     pass
-            self._rebuild_conv_list()
+            self._rebuild_sidebar()
 
         elif ptype == "GROUP_RESULT":
             action, result, gname = parts[1], parts[2], parts[3]
             if result == "OK":
-                if action in ["JOIN", "CREATE"] and gname not in self.groups:
+                if action in ("CREATE", "JOIN") and gname not in self.groups:
                     self.groups.append(gname)
-                    self._rebuild_conv_list()
-                    self._switch_chat(gname)
+                    self._rebuild_sidebar()
+                    self._switch(gname)
                 elif action == "LEAVE" and gname in self.groups:
                     self.groups.remove(gname)
-                    if self.active_chat == gname:
-                        self._switch_chat("Global")
-                    self._rebuild_conv_list()
+                    if self.active == gname:
+                        self._switch("Global")
+                    self._rebuild_sidebar()
             else:
-                messagebox.showerror("Group Error", f"Action failed: {result}")
+                msgs = {"EXISTS": "Group already exists.", "NOT_FOUND": "Group not found."}
+                messagebox.showwarning("Group", msgs.get(result, f"Error: {result}"), parent=self.win)
 
-    # ── MESSAGE RENDERING ────────────────────────────────────────
-    def _increment_unread(self, chat_id: str):
-        if self.active_chat != chat_id:
-            self.unread[chat_id] = self.unread.get(chat_id, 0) + 1
-            self._rebuild_conv_list()
+        elif ptype in ("FILE_DATA", "FILE_SENT"):
+            # FILE_DATA|[ts]|sender|recip|filename|size  + binary
+            if len(parts) < 6 or data is None:
+                return
+            ts, sender, recip, fname = parts[1], parts[2], parts[3], parts[4]
+            is_group = recip in self.groups
+            chat_id = recip if is_group else (sender if sender != self.username else recip)
+            own = (sender == self.username)
+            disp = "You" if own else sender
+            ext = os.path.splitext(fname)[1].lower()
 
-    def _create_bubble_container(self, target_frame: ctk.CTkScrollableFrame, ts: str, sender: str, own: bool, is_system: bool):
-        # Outer frame to align left/right/center
-        row_frame = ctk.CTkFrame(target_frame, fg_color="transparent")
-        row_frame.pack(fill="x", padx=5, pady=5)
-        
-        if is_system:
-            bubble = ctk.CTkFrame(row_frame, fg_color="#36393e", corner_radius=8)
-            bubble.pack(anchor="center", pady=2)
-            lbl = ctk.CTkLabel(bubble, text=f"{ts} [System] {sender}", text_color=TEXT_DIM, font=ctk.CTkFont(size=11, slant="italic"))
-            lbl.pack(padx=10, pady=5)
-            return bubble
+            if ext in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"):
+                try:
+                    from PIL import Image, ImageTk
+                    img = Image.open(io.BytesIO(data))
+                    img.thumbnail((280, 280))
+                    tk_img = ImageTk.PhotoImage(img)
+                    self._bubble(chat_id, ts, disp, "", own=own, image=tk_img)
+                except ImportError:
+                    self._bubble(chat_id, ts, disp, f"[Image] {fname}", own=own)
+            elif ext == ".wav":
+                self._bubble(chat_id, ts, disp, "", own=own, audio_data=data)
+            else:
+                self._bubble(chat_id, ts, disp, "", own=own,
+                             file_name=fname, file_data=data)
 
-        anchor = "e" if own else "w"
-        color = BG_BUBBLE_OWN if own else BG_BUBBLE_OTHER
-
-        bubble = ctk.CTkFrame(row_frame, fg_color=color, corner_radius=15)
-        bubble.pack(anchor=anchor, padx=10)
-
-        # Header: Sender + Time
-        hdr = ctk.CTkFrame(bubble, fg_color="transparent", height=15)
-        hdr.pack(fill="x", padx=10, pady=(5, 0))
-        
-        sender_color = "#4CAF50" if own else ACCENT
-        ctk.CTkLabel(hdr, text=sender, font=ctk.CTkFont(size=12, weight="bold"), text_color=sender_color).pack(side="left")
-        ctk.CTkLabel(hdr, text=ts, font=ctk.CTkFont(size=10), text_color=TEXT_DIM).pack(side="right", padx=(10, 0))
-
-        return bubble
-
-    def _handle_msg(self, chat_id: str, ts: str, sender: str, body: str, own: bool, is_system: bool = False):
-        frame = self._create_chat_frame(chat_id)
-        bubble = self._create_bubble_container(frame, ts, sender, own, is_system)
-        
-        if not is_system:
-            txt_lbl = ctk.CTkLabel(bubble, text=body, text_color=TEXT_COLOR, font=ctk.CTkFont(size=14), justify="left", wraplength=400)
-            txt_lbl.pack(padx=12, pady=(2, 8), anchor="w")
-
-        if not own:
-            self._increment_unread(chat_id)
-        
-        if self.active_chat == chat_id:
-            frame._parent_canvas.yview_moveto(1.0)
-
-    def _handle_file(self, chat_id: str, ts: str, sender: str, filename: str, data: bytes, own: bool):
-        frame = self._create_chat_frame(chat_id)
-        bubble = self._create_bubble_container(frame, ts, sender, own, False)
-        
-        ext = os.path.splitext(filename)[1].lower()
-
-        if ext in [".png", ".jpg", ".jpeg", ".gif"]:
-            # Render Image
-            try:
-                img = Image.open(io.BytesIO(data))
-                img.thumbnail((250, 250))
-                ctk_img = ctk.CTkImage(light_image=img, dark_image=img, size=img.size)
-                img_lbl = ctk.CTkLabel(bubble, image=ctk_img, text="")
-                img_lbl.pack(padx=10, pady=(2, 8))
-            except Exception as e:
-                ctk.CTkLabel(bubble, text="[Image format not supported]", text_color="#F44336").pack(padx=10, pady=5)
-        
-        elif ext in [".wav"]:
-            # Render Audio Player
-            audio_frame = ctk.CTkFrame(bubble, fg_color="transparent")
-            audio_frame.pack(padx=10, pady=(2, 8), fill="x")
-            
-            ctk.CTkLabel(audio_frame, text="🎵 Voice Message", font=ctk.CTkFont(size=12)).pack(side="left")
-            play_btn = ctk.CTkButton(audio_frame, text="▶ Play", width=60, height=24, command=lambda d=data: self._play_audio(d))
-            play_btn.pack(side="right", padx=(10, 0))
-
-        else:
-            # Generic File
-            file_frame = ctk.CTkFrame(bubble, fg_color="transparent")
-            file_frame.pack(padx=10, pady=(2, 8), fill="x")
-            
-            size_kb = len(data) / 1024
-            ctk.CTkLabel(file_frame, text=f"📎 {filename} ({size_kb:.1f} KB)", font=ctk.CTkFont(size=12)).pack(side="left")
-            save_btn = ctk.CTkButton(file_frame, text="💾 Save", width=60, height=24, command=lambda f=filename, d=data: self._save_file(f, d))
-            save_btn.pack(side="right", padx=(10, 0))
-
-        if not own:
-            self._increment_unread(chat_id)
-        if self.active_chat == chat_id:
-            frame._parent_canvas.yview_moveto(1.0)
-
-    # ── MEDIA ACTIONS ────────────────────────────────────────────
-    def _play_audio(self, binary_data: bytes):
-        try:
-            data, fs = sf.read(io.BytesIO(binary_data))
-            sd.play(data, fs)
-        except Exception as e:
-            messagebox.showerror("Audio Error", str(e), parent=self.window)
-
-    def _start_voice_record(self, event):
-        self.btn_voice.configure(text="🔴", text_color="#f44336")
-        self.is_recording = True
-        self.audio_frames = []
-        try:
-            self.audio_stream = sd.InputStream(samplerate=44100, channels=1, callback=self._audio_callback)
-            self.audio_stream.start()
-        except Exception as e:
-            self.is_recording = False
-            messagebox.showerror("Mic Error", str(e), parent=self.window)
-
-    def _audio_callback(self, indata, frames, time, status):
-        if self.is_recording:
-            self.audio_frames.append(indata.copy())
-
-    def _stop_voice_record(self, event):
-        self.btn_voice.configure(text="🎤", text_color=TEXT_COLOR)
-        if not self.is_recording:
-            return
-        self.is_recording = False
-        try:
-            self.audio_stream.stop()
-            self.audio_stream.close()
-            
-            if not self.audio_frames: return
-            audio_data = np.concatenate(self.audio_frames, axis=0)
-            
-            buf = io.BytesIO()
-            sf.write(buf, audio_data, 44100, format='WAV')
-            binary_data = buf.getvalue()
-            
-            filename = f"voice_{int(time.time())}.wav"
-            self._send_binary_payload(filename, binary_data)
-        except Exception as e:
-            messagebox.showerror("Recording Error", str(e), parent=self.window)
-
-    def _send_file(self):
-        path = filedialog.askopenfilename(parent=self.window, title="Select File to Send")
-        if not path:
-            return
-        size = os.path.getsize(path)
-        if size > 20 * 1024 * 1024:
-            messagebox.showerror("Error", "File exceeds 20MB limit.", parent=self.window)
-            return
-            
-        with open(path, "rb") as f:
-            data = f.read()
-        filename = os.path.basename(path)
-        self._send_binary_payload(filename, data)
-
-    def _send_binary_payload(self, filename: str, data: bytes):
-        target = self.active_chat
-        if target == "Global":
-            messagebox.showinfo("Not Supported", "Files cannot be sent to Global chat.", parent=self.window)
-            return
-        
-        try:
-            payload = f"FILE_DATA|{target}|{filename}".encode("utf-8")
-            header = struct.pack("!I", len(payload))
-            
-            # Send framing: HeaderLen -> HeaderBytes -> DataLen -> DataBytes
-            self.sock.sendall(header)
-            self.sock.sendall(payload)
-            self.sock.sendall(struct.pack("!I", len(data)))
-            self.sock.sendall(data)
-            
-            # Echo it locally immediately to look responsive
-            self._handle_file(target, time.strftime("[%H:%M]"), "You", filename, data, own=True)
-            
-        except Exception as e:
-            messagebox.showerror("Send Error", str(e), parent=self.window)
-
-    def _save_file(self, filename: str, data: bytes):
-        path = filedialog.asksaveasfilename(parent=self.window, initialfile=filename)
-        if path:
-            try:
-                with open(path, "wb") as f:
-                    f.write(data)
-                messagebox.showinfo("Success", f"Saved to {path}", parent=self.window)
-            except Exception as e:
-                messagebox.showerror("Save Error", str(e), parent=self.window)
-
-    # ── SENDING MESSAGES ─────────────────────────────────────────
-    def _send_text_message(self):
-        text = self.input_entry.get().strip()
+    # ── Send ──────────────────────────────────────────────────────────────────
+    def _send_msg(self):
+        text = self.input_var.get().strip()
         if not text:
             return
-        self.input_entry.delete(0, tk.END)
-
-        target = self.active_chat
-        if target == "Global":
+        self.input_var.set("")
+        if self.active == "Global":
             send_text(self.sock, text)
-        elif target in self.groups:
-            send_text(self.sock, f"GROUP_MSG|{target}|{text}")
+        elif self.active in self.groups:
+            send_text(self.sock, f"GROUP_MSG|{self.active}|{text}")
         else:
-            # DM
-            send_text(self.sock, f"@{target} {text}")
+            send_text(self.sock, f"@{self.active} {text}")
 
-    # ── GROUPS & EMOJIS ──────────────────────────────────────────
-    def _prompt_create_group(self):
-        dialog = ctk.CTkInputDialog(text="Enter new group name:", title="New Group")
-        name = dialog.get_input()
-        if name:
-            send_text(self.sock, f"GROUP_CREATE|{name.strip()}")
+    # ── File attachment (pick → preview → send) ───────────────────────────────
+    def _pick_file(self):
+        if self.active == "Global":
+            messagebox.showinfo("Info", "Files cannot be sent to Global chat.", parent=self.win)
+            return
+        path = filedialog.askopenfilename(parent=self.win, title="Select File")
+        if not path:
+            return
+        if os.path.getsize(path) > 20 * 1024 * 1024:
+            messagebox.showerror("Error", "File exceeds 20 MB limit.", parent=self.win)
+            return
+        with open(path, "rb") as f:
+            raw = f.read()
+        fname = os.path.basename(path)
+        self._pending_file = (fname, raw)
+        kb = len(raw) / 1024
+        ext = os.path.splitext(fname)[1].lower()
 
-    def _prompt_join_group(self):
-        dialog = ctk.CTkInputDialog(text="Enter group name to join:", title="Join Group")
-        name = dialog.get_input()
-        if name:
-            send_text(self.sock, f"GROUP_JOIN|{name.strip()}")
+        # Show thumbnail if image
+        self.preview_thumb.config(image="", text="")
+        if ext in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"):
+            try:
+                from PIL import Image, ImageTk
+                img = Image.open(io.BytesIO(raw))
+                img.thumbnail((40, 40))
+                tk_img = ImageTk.PhotoImage(img)
+                self.preview_thumb.config(image=tk_img)
+                self.preview_thumb._img = tk_img   # prevent GC
+            except Exception:
+                self.preview_thumb.config(text="🖼️", font=("Segoe UI Emoji", 18))
+        else:
+            self.preview_thumb.config(text="📄", font=("Segoe UI Emoji", 18))
 
-    def _leave_group(self):
-        target = self.active_chat
-        if target in self.groups:
-            if messagebox.askyesno("Leave Group", f"Are you sure you want to leave {target}?", parent=self.window):
-                send_text(self.sock, f"GROUP_LEAVE|{target}")
+        self.preview_lbl.config(text=f"{fname}  ({kb:.1f} KB)")
+        # Show preview bar at row=2 (between chat_area=1 and input=3)
+        self.preview_bar.grid(row=2, column=0, sticky="ew")
 
-    def _show_emoji_picker(self):
-        top = ctk.CTkToplevel(self.window)
-        top.title("Emojis")
-        top.geometry("300x200")
+    def _cancel_file(self):
+        self._pending_file = None
+        self.preview_thumb.config(image="", text="")
+        self.preview_bar.grid_forget()
+
+    def _send_pending_file(self):
+        if not self._pending_file:
+            return
+        if self.active == "Global":
+            messagebox.showinfo("Info", "Files cannot be sent to Global chat.", parent=self.win)
+            return
+        fname, raw = self._pending_file
+        send_binary(self.sock, f"FILE_DATA|{self.active}|{fname}", raw)
+        self._cancel_file()
+
+    # Old alias kept for safety
+    def _send_file(self):
+        self._pick_file()
+
+    # ── Voice recording — click toggle + timer bar ───────────────────────
+    def _voice_toggle(self):
+        """Click once to start, click again to stop+send."""
+        if self.active == "Global":
+            messagebox.showinfo("Info", "Voice messages cannot be sent to Global chat.",
+                                parent=self.win)
+            return
+        if not self._recording:
+            self._voice_start_rec()
+        else:
+            self._voice_stop_send()
+
+    def _voice_start_rec(self):
+        try:
+            import sounddevice as sd
+        except ImportError:
+            messagebox.showerror("Error",
+                "sounddevice not installed. Run: pip install sounddevice soundfile numpy",
+                parent=self.win)
+            return
+        try:
+            self._recording    = True
+            self._audio_frames = []
+            self._rec_seconds  = 0
+            self.voice_btn.config(text="⏹️", bg=RED)   # stop icon when active
+            # Show timer bar at row=2
+            self.voice_bar.grid(row=2, column=0, sticky="ew")
+            self._voice_tick()  # start live counter
+
+            def _cb(indata, frames, t, status):
+                if self._recording:
+                    self._audio_frames.append(indata.copy())
+
+            self._audio_stream = sd.InputStream(samplerate=44100, channels=1, callback=_cb)
+            self._audio_stream.start()
+        except Exception as e:
+            self._recording = False
+            self.voice_btn.config(text="🎤", bg=PANEL)
+            self.voice_bar.grid_forget()
+            messagebox.showerror("Mic Error", str(e), parent=self.win)
+
+    def _voice_tick(self):
+        """Update the recording timer every second."""
+        if not self._recording:
+            return
+        self._rec_seconds += 1
+        m, s = divmod(self._rec_seconds, 60)
+        self.voice_timer_lbl.config(text=f"{m}:{s:02d}")
+        self.win.after(1000, self._voice_tick)
+
+    def _voice_cancel(self):
+        """Discard recording without sending."""
+        self._recording = False
+        try:
+            if self._audio_stream:
+                self._audio_stream.stop()
+                self._audio_stream.close()
+        except Exception:
+            pass
+        self._audio_frames = []
+        self.voice_btn.config(text="🎤", bg=PANEL)
+        self.voice_bar.grid_forget()
+
+    def _voice_stop_send(self):
+        """Stop recording and send the audio."""
+        if not self._recording:
+            return
+        self._recording = False
+        self.voice_btn.config(text="🎤", bg=PANEL)
+        self.voice_bar.grid_forget()
+        try:
+            if self._audio_stream:
+                self._audio_stream.stop()
+                self._audio_stream.close()
+        except Exception:
+            pass
+        if not self._audio_frames:
+            return
+        try:
+            import numpy as np
+            import soundfile as sf
+            audio = np.concatenate(self._audio_frames, axis=0)
+            buf = io.BytesIO()
+            sf.write(buf, audio, 44100, format="WAV")
+            raw = buf.getvalue()
+            fname = f"voice_{int(time.time())}.wav"
+            send_binary(self.sock, f"FILE_DATA|{self.active}|{fname}", raw)
+        except Exception as e:
+            messagebox.showerror("Recording Error", str(e), parent=self.win)
+
+    # Keep old bindings alive (no-ops now)
+    def _voice_start(self, _e): pass
+    def _voice_stop(self, _e):  pass
+
+    def _play_audio(self, data: bytes):
+        try:
+            import sounddevice as sd
+            import soundfile as sf
+            import io as _io
+            audio, fs = sf.read(_io.BytesIO(data))
+            sd.play(audio, fs)
+        except Exception as e:
+            messagebox.showerror("Playback Error", str(e), parent=self.win)
+
+    # ── Emoji picker — colored via PIL ────────────────────────────────────────
+    def _make_emoji_img(self, char: str, size: int = 36):
+        """Render a colored emoji via Pillow (Segoe UI Emoji font on Windows)."""
+        if char in self._emoji_imgs:
+            return self._emoji_imgs[char]
+        try:
+            from PIL import Image, ImageDraw, ImageFont, ImageTk
+            img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(img)
+            font_path = "C:/Windows/Fonts/seguiemj.ttf"
+            font = ImageFont.truetype(font_path, size - 6)
+            draw.text((2, 1), char, font=font, embedded_color=True)
+            tk_img = ImageTk.PhotoImage(img)
+            self._emoji_imgs[char] = tk_img
+            return tk_img
+        except Exception:
+            return None
+
+    def _emoji_picker(self):
+        top = tk.Toplevel(self.win)
+        top.title("Emoji")
+        top.configure(bg=CARD)
         top.resizable(False, False)
         top.attributes("-topmost", True)
-        
-        # Grid of popular emojis
-        emojis = ["😀","😂","🤣","😊","😍","😘","🥰","😎","🤩","😏","🤔","😐","🙄",
-                  "😴","😷","🥳","🤯","😱","🤬","💔","❤️","🔥","👍","👎","👏","🤝","🙌"]
-                  
-        frame = ctk.CTkScrollableFrame(top)
-        frame.pack(fill="both", expand=True, padx=5, pady=5)
-        
-        for i, emj in enumerate(emojis):
-            row = i // 5
-            col = i % 5
-            btn = ctk.CTkButton(frame, text=emj, width=40, height=40, font=ctk.CTkFont(size=20), fg_color="transparent", hover_color=BG_BUBBLE_OTHER)
-            btn.grid(row=row, column=col, padx=2, pady=2)
-            btn.configure(command=lambda e=emj, w=top: self._insert_emoji(e, w))
+        COLS = 6
+        for i, em in enumerate(EMOJIS):
+            r, c = divmod(i, COLS)
+            img = self._make_emoji_img(em, 36)
+            if img:
+                btn = tk.Button(top, image=img, bg=CARD, relief="flat",
+                                cursor="hand2", bd=0,
+                                command=lambda e=em, w=top: (
+                                    self.input_var.set(self.input_var.get() + e),
+                                    w.destroy()))
+                btn._img = img   # prevent GC
+            else:
+                btn = tk.Button(top, text=em, font=FONT_EMOJI, bg=CARD, fg=TEXT,
+                                relief="flat", cursor="hand2",
+                                command=lambda e=em, w=top: (
+                                    self.input_var.set(self.input_var.get() + e),
+                                    w.destroy()))
+            btn.grid(row=r, column=c, padx=4, pady=4)
 
-    def _insert_emoji(self, emoji_char, window):
-        self.input_entry.insert(tk.END, emoji_char)
-        window.destroy()
-        self.input_entry.focus()
+    # ── File save ─────────────────────────────────────────────────────────────
+    def _save_file(self, fname: str, data: bytes):
+        path = filedialog.asksaveasfilename(parent=self.win, initialfile=fname)
+        if path:
+            with open(path, "wb") as f:
+                f.write(data)
+            messagebox.showinfo("Saved", f"Saved to {path}", parent=self.win)
 
-    # ── CLEANUP ──────────────────────────────────────────────────
-    def _on_close(self):
+    # ── Groups ────────────────────────────────────────────────────────────────
+    def _new_group(self):
+        dlg = _InputDialog(self.win, "New Group",
+                           "Group name:", "Members (comma separated):")
+        if dlg.result:
+            gname, raw_members = dlg.result
+            members = [m.strip() for m in raw_members.split(",") if m.strip()]
+            send_text(self.sock, f"GROUP_CREATE|{gname}|{','.join(members)}")
+
+    def _join_group(self):
+        dlg = _SimpleInput(self.win, "Join Group", "Enter group name:")
+        if dlg.result:
+            send_text(self.sock, f"GROUP_JOIN|{dlg.result.strip()}")
+
+    def _leave_group(self):
+        if self.active in self.groups:
+            if messagebox.askyesno("Leave", f"Leave '{self.active}'?", parent=self.win):
+                send_text(self.sock, f"GROUP_LEAVE|{self.active}")
+
+    # ── Cleanup ───────────────────────────────────────────────────────────────
+    def _disconnected(self):
+        self.running = False
+        messagebox.showerror("Disconnected", "Server closed the connection.", parent=self.win)
+        self._close()
+
+    def _close(self):
         self.running = False
         try:
             self.sock.close()
-        except: pass
-        self.window.destroy()
+        except Exception:
+            pass
+        self.win.destroy()
         self.root.destroy()
+
+
+# ── Simple dialogs ─────────────────────────────────────────────────────────────
+class _SimpleInput:
+    def __init__(self, parent, title, prompt):
+        self.result = None
+        top = tk.Toplevel(parent)
+        top.title(title)
+        top.configure(bg=BG)
+        top.resizable(False, False)
+        top.grab_set()
+        tk.Label(top, text=prompt, font=FONT, fg=TEXT, bg=BG).pack(padx=20, pady=(16, 4))
+        e = tk.Entry(top, font=FONT, bg=CARD, fg=TEXT,
+                     insertbackground=TEXT, relief="flat", bd=6)
+        e.pack(padx=20, ipady=6, pady=(0, 12))
+        e.focus()
+
+        def _ok():
+            self.result = e.get().strip() or None
+            top.destroy()
+
+        tk.Button(top, text="OK", font=FONT_BOLD, bg=ACCENT2, fg=TEXT,
+                  relief="flat", cursor="hand2", padx=16, pady=6,
+                  command=_ok).pack(pady=(0, 12))
+        e.bind("<Return>", lambda ev: _ok())
+        top.wait_window()
+
+
+class _InputDialog:
+    def __init__(self, parent, title, label1, label2):
+        self.result = None
+        top = tk.Toplevel(parent)
+        top.title(title)
+        top.configure(bg=BG)
+        top.resizable(False, False)
+        top.grab_set()
+
+        for lbl in (label1, label2):
+            tk.Label(top, text=lbl, font=FONT, fg=TEXT, bg=BG, anchor="w").pack(
+                fill="x", padx=20, pady=(12, 2))
+            e = tk.Entry(top, font=FONT, bg=CARD, fg=TEXT,
+                         insertbackground=TEXT, relief="flat", bd=6)
+            e.pack(fill="x", padx=20, ipady=6)
+            if lbl == label1:
+                self._e1 = e
+                e.focus()
+            else:
+                self._e2 = e
+
+        def _ok():
+            v1 = self._e1.get().strip()
+            v2 = self._e2.get().strip()
+            if v1:
+                self.result = (v1, v2)
+            top.destroy()
+
+        tk.Button(top, text="Create", font=FONT_BOLD, bg=ACCENT, fg=TEXT,
+                  relief="flat", cursor="hand2", padx=16, pady=8,
+                  command=_ok).pack(pady=16)
+        self._e1.bind("<Return>", lambda ev: self._e2.focus())
+        self._e2.bind("<Return>", lambda ev: _ok())
+        top.wait_window()

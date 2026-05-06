@@ -1,471 +1,277 @@
-
+"""Server Admin Panel — same palette as client."""
 import threading
 import tkinter as tk
 from tkinter import messagebox, scrolledtext
-from typing import Union
 
-import server  # type: ignore  # Our chat server module
+import server
 
-# ─────────────────────────────────────────────
-# Color Palette (matches client dark theme)
-# ─────────────────────────────────────────────
-BG_DARK      = "#1e1e2e"
-BG_MID       = "#2a2a3e"
-BG_PANEL     = "#252535"
-ACCENT       = "#7c6af7"
-ACCENT_HOVER = "#9a8fff"
-TEXT_MAIN    = "#cdd6f4"
-TEXT_DIM     = "#6c7086"
-TEXT_SYSTEM  = "#a6e3a1"
-TEXT_WARN    = "#f38ba8"
-TEXT_GOLD    = "#f9e2af"
-BTN_FG       = "#ffffff"
-BTN_RED      = "#e06c75"
-BTN_RED_HOV  = "#f38ba8"
-BTN_GOLD     = "#e5a50a"
-BTN_GOLD_HOV = "#f9c74f"
-BTN_MUTE     = "#89b4fa"
-BTN_MUTE_HOV = "#b4d0f7"
-INPUT_BG     = "#313244"
-ONLINE_COLOR = "#a6e3a1"
-MUTED_COLOR  = "#f38ba8"
+# ── Palette (SAME as client) ───────────────────────────────────────────────────
+BG       = "#080d1a"
+PANEL    = "#0d1429"
+CARD     = "#111d38"
+ACCENT   = "#3d7ae5"
+ACCENT2  = "#5865f2"
+TEXT     = "#dce6f5"
+DIM      = "#7a8ba8"
+INPUT_BG = "#080d1a"
+BORDER   = "#1e3059"
+RED      = "#da3633"
+GOLD     = "#e3b341"
+MUTED_C  = "#da3633"
+ONLINE_C = "#3d9be9"
 
-FONT_MAIN  = ("Segoe UI", 11)
+FONT       = ("Segoe UI", 11)
 FONT_BOLD  = ("Segoe UI", 11, "bold")
-FONT_TITLE = ("Segoe UI", 16, "bold")
+FONT_TITLE = ("Segoe UI", 18, "bold")
 FONT_SMALL = ("Segoe UI", 9)
 FONT_MONO  = ("Consolas", 10)
 
 
-# ─────────────────────────────────────────────
-# Tiny helper: a "not-yet-ready" log box stub
-# ─────────────────────────────────────────────
-class _LogBoxStub:
-    """Placeholder used before the real ScrolledText widget is created."""
-
-    def config(self, **_kw):
-        pass
-
-    def insert(self, *_a, **_kw):
-        pass
-
-    def see(self, _idx):
-        pass
-
-    def pack(self, **_kw):
-        pass
-
-    def tag_config(self, *_a, **_kw):
-        pass
-
-
-class ServerAdminGUI(tk.Tk):
-
-    def __init__(self) -> None:
+class ServerGUI(tk.Tk):
+    def __init__(self):
         super().__init__()
+        self.title("Chat App — Admin Panel")
+        self.configure(bg=BG)
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self._center(1050, 680)
+        self._selected = ""
+        self._build()
+        self._hook()
+        threading.Thread(target=server.start, daemon=True).start()
+        self.after(600, lambda: self.status_lbl.config(
+            text="🟢  Running  •  Port 5555", fg=ONLINE_C))
 
-        self.log_box: Union[scrolledtext.ScrolledText, _LogBoxStub] = _LogBoxStub()
-        self._selected_user: str = ""
-        self.kick_btn: tk.Button
-        self.mute_btn: tk.Button
-        self.status_lbl: tk.Label
-        self.users_frame: tk.Frame
-        self.user_count_lbl: tk.Label
-        self.queue_lbl: tk.Label
-        self.announce_entry: tk.Entry
-        self._server_thread: threading.Thread
-
-        self.title("ChatApp – Server Admin Panel")
-        self.configure(bg=BG_DARK)
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
-        self._center(1000, 700)
-        self._build_ui()
-        self._hook_server()
-        self._start_server()
-
-    # ── Window helpers ───────────────────────
-    def _center(self, w: int, h: int) -> None:
+    def _center(self, w, h):
         self.update_idletasks()
-        sw: int = self.winfo_screenwidth()
-        sh: int = self.winfo_screenheight()
-        self.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        self.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
 
-    # ── UI Construction ──────────────────────
-    def _build_ui(self) -> None:
-        # TOP BAR ──────────────────────────────
-        top = tk.Frame(self, bg=BG_MID, pady=10, padx=16)
+    def _build(self):
+        # ── Top bar ────────────────────────────────────────────────────────
+        top = tk.Frame(self, bg=PANEL, pady=12, padx=16)
         top.pack(fill="x")
-
-        tk.Label(
-            top, text="🖥️  ChatApp – Admin Panel",
-            font=FONT_TITLE, fg=ACCENT, bg=BG_MID,
-        ).pack(side="left")
-
-        self.status_lbl = tk.Label(
-            top, text="⏳  Starting…",
-            font=FONT_SMALL, fg=TEXT_DIM, bg=BG_MID,
-        )
+        tk.Label(top, text="🖥️  Chat App — Admin Panel",
+                 font=FONT_TITLE, fg=ACCENT2, bg=PANEL).pack(side="left")
+        self.status_lbl = tk.Label(top, text="⏳  Starting…",
+                                   font=FONT_SMALL, fg=DIM, bg=PANEL)
         self.status_lbl.pack(side="right")
 
-        # STATS BAR ────────────────────────────
-        stats = tk.Frame(self, bg=BG_PANEL, pady=6, padx=16)
+        # ── Stats row ──────────────────────────────────────────────────────
+        stats = tk.Frame(self, bg=CARD, pady=6, padx=16)
         stats.pack(fill="x")
-
-        self.queue_lbl = tk.Label(
-            stats, text="📬  Offline queue: 0 pending",
-            font=FONT_SMALL, fg=TEXT_DIM, bg=BG_PANEL,
-        )
+        self.queue_lbl = tk.Label(stats, text="📬  Queue: 0",
+                                  font=FONT_SMALL, fg=DIM, bg=CARD)
         self.queue_lbl.pack(side="left")
+        self.muted_lbl = tk.Label(stats, text="🔇  Muted: 0",
+                                  font=FONT_SMALL, fg=DIM, bg=CARD)
+        self.muted_lbl.pack(side="left", padx=(20, 0))
 
-        self.muted_count_lbl = tk.Label(
-            stats, text="🔇  Muted: 0",
-            font=FONT_SMALL, fg=TEXT_DIM, bg=BG_PANEL,
-        )
-        self.muted_count_lbl.pack(side="left", padx=(20, 0))
+        # ── Main area ──────────────────────────────────────────────────────
+        main = tk.Frame(self, bg=BG)
+        main.pack(fill="both", expand=True, padx=10, pady=8)
 
-        # MAIN AREA ────────────────────────────
-        main = tk.Frame(self, bg=BG_DARK)
-        main.pack(fill="both", expand=True, padx=12, pady=10)
-
-        # LEFT: Log ────────────────────────────
-        left = tk.Frame(main, bg=BG_DARK)
+        # Log (left)
+        left = tk.Frame(main, bg=BG)
         left.pack(side="left", fill="both", expand=True)
+        tk.Label(left, text="📋  Server Log", font=FONT_BOLD,
+                 fg=TEXT, bg=BG, anchor="w").pack(fill="x", pady=(0, 4))
+        self.log = scrolledtext.ScrolledText(
+            left, state="disabled", bg=PANEL, fg=TEXT,
+            font=FONT_MONO, relief="flat", bd=0, padx=8, pady=8,
+            wrap="word", cursor="arrow")
+        self.log.pack(fill="both", expand=True)
+        self.log.tag_config("info",  foreground=TEXT)
+        self.log.tag_config("join",  foreground=ONLINE_C)
+        self.log.tag_config("leave", foreground=RED)
+        self.log.tag_config("kick",  foreground=RED)
+        self.log.tag_config("mute",  foreground=ACCENT2)
+        self.log.tag_config("queue", foreground=GOLD)
+        self.log.tag_config("msg",   foreground="#89b4fa")
+        self.log.tag_config("ann",   foreground=GOLD)
 
-        tk.Label(
-            left, text="📋  Server Log",
-            font=FONT_BOLD, fg=TEXT_MAIN, bg=BG_DARK, anchor="w",
-        ).pack(fill="x", pady=(0, 4))
-
-        self.log_box = scrolledtext.ScrolledText(
-            left,
-            state="disabled",
-            bg=BG_MID, fg=TEXT_MAIN,
-            font=FONT_MONO,
-            relief="flat", bd=0,
-            padx=8, pady=8,
-            wrap="word", cursor="arrow",
-        )
-        self.log_box.pack(fill="both", expand=True)
-        self.log_box.tag_config("info",     foreground=TEXT_MAIN)
-        self.log_box.tag_config("join",     foreground=TEXT_SYSTEM)
-        self.log_box.tag_config("leave",    foreground=TEXT_WARN)
-        self.log_box.tag_config("kick",     foreground=TEXT_WARN,  font=("Consolas", 10, "bold"))
-        self.log_box.tag_config("mute",     foreground=BTN_MUTE,   font=("Consolas", 10, "bold"))
-        self.log_box.tag_config("queue",    foreground=TEXT_GOLD)
-        self.log_box.tag_config("msg",      foreground="#89b4fa")
-        self.log_box.tag_config("header",   foreground=ACCENT,     font=("Consolas", 10, "bold"))
-        self.log_box.tag_config("announce", foreground=TEXT_GOLD,  font=("Consolas", 10, "bold"))
-
-        # RIGHT: Users + controls ──────────────
-        right = tk.Frame(main, bg=BG_PANEL, width=240, padx=10, pady=12)
-        right.pack(side="right", fill="y", padx=(12, 0))
+        # Right panel
+        right = tk.Frame(main, bg=PANEL, width=230, padx=10, pady=12)
+        right.pack(side="right", fill="y", padx=(10, 0))
         right.pack_propagate(False)
 
-        tk.Label(
-            right, text="🟢  Online Users",
-            font=FONT_BOLD, fg=TEXT_SYSTEM, bg=BG_PANEL,
-        ).pack(anchor="w")
+        tk.Label(right, text="🟢  Online Users", font=FONT_BOLD,
+                 fg=ONLINE_C, bg=PANEL).pack(anchor="w")
+        tk.Frame(right, bg=BORDER, height=1).pack(fill="x", pady=(4, 8))
 
-        tk.Frame(right, bg=TEXT_DIM, height=1).pack(fill="x", pady=(4, 8))
+        self.user_frame = tk.Frame(right, bg=PANEL)
+        self.user_frame.pack(fill="both", expand=True)
 
-        self.users_frame = tk.Frame(right, bg=BG_PANEL)
-        self.users_frame.pack(fill="both", expand=True)
+        self.user_count = tk.Label(right, text="0 online",
+                                   font=FONT_SMALL, fg=DIM, bg=PANEL)
+        self.user_count.pack(anchor="w", pady=(6, 10))
 
-        self.user_count_lbl = tk.Label(
-            right, text="0 users online",
-            font=FONT_SMALL, fg=TEXT_DIM, bg=BG_PANEL,
-        )
-        self.user_count_lbl.pack(anchor="w", pady=(6, 12))
+        tk.Frame(right, bg=BORDER, height=1).pack(fill="x", pady=(0, 8))
 
-        tk.Frame(right, bg=TEXT_DIM, height=1).pack(fill="x", pady=(0, 10))
+        # Announcement
+        tk.Label(right, text="📢  Announcement", font=FONT_BOLD,
+                 fg=GOLD, bg=PANEL).pack(anchor="w", pady=(0, 4))
+        self.ann_entry = tk.Entry(right, font=FONT, bg=INPUT_BG, fg=TEXT,
+                                  insertbackground=TEXT, relief="flat",
+                                  highlightthickness=1,
+                                  highlightbackground=BORDER, bd=4)
+        self.ann_entry.pack(fill="x", ipady=6, pady=(0, 6))
+        self.ann_entry.bind("<Return>", lambda e: self._announce())
+        tk.Button(right, text="📢 Send to All", font=FONT_BOLD,
+                  bg=GOLD, fg="#0d1117", relief="flat", cursor="hand2",
+                  pady=6, command=self._announce).pack(fill="x", pady=(0, 10))
 
-        # ── Admin Announcement ─────────────────
-        tk.Label(
-            right, text="📢  Announcement",
-            font=FONT_BOLD, fg=TEXT_GOLD, bg=BG_PANEL,
-        ).pack(anchor="w", pady=(0, 4))
+        tk.Frame(right, bg=BORDER, height=1).pack(fill="x", pady=(0, 8))
 
-        self.announce_entry = tk.Entry(
-            right,
-            font=FONT_MAIN, bg=INPUT_BG, fg=TEXT_MAIN,
-            insertbackground=TEXT_MAIN,
-            relief="flat", bd=4,
-        )
-        self.announce_entry.pack(fill="x", ipady=5, pady=(0, 6))
-        self.announce_entry.bind("<Return>", lambda e: self._send_announcement())
-
-        announce_btn = tk.Button(
-            right, text="📢  Send to All",
-            font=FONT_BOLD, bg=BTN_GOLD, fg="#1e1e2e",
-            activebackground=BTN_GOLD_HOV, activeforeground="#1e1e2e",
-            relief="flat", cursor="hand2", pady=6,
-            command=self._send_announcement,
-        )
-        announce_btn.pack(fill="x", pady=(0, 12))
-        announce_btn.bind("<Enter>", lambda e, b=announce_btn: b.config(bg=BTN_GOLD_HOV))  # type: ignore[arg-type]
-        announce_btn.bind("<Leave>", lambda e, b=announce_btn: b.config(bg=BTN_GOLD))  # type: ignore[arg-type]
-
-        tk.Frame(right, bg=TEXT_DIM, height=1).pack(fill="x", pady=(0, 10))
-
-        # ── Mute / Unmute button ───────────────
-        self.mute_btn = tk.Button(
-            right, text="🔇  Mute Selected",
-            font=FONT_BOLD, bg=BTN_MUTE, fg="#1e1e2e",
-            activebackground=BTN_MUTE_HOV, activeforeground="#1e1e2e",
-            relief="flat", cursor="hand2", pady=8,
-            command=self._mute_selected,
-        )
+        # Mute button
+        self.mute_btn = tk.Button(right, text="🔇  Mute Selected",
+                                  font=FONT_BOLD, bg=ACCENT2, fg=TEXT,
+                                  relief="flat", cursor="hand2", pady=8,
+                                  command=self._mute)
         self.mute_btn.pack(fill="x", pady=(0, 6))
-        self.mute_btn.bind("<Enter>", lambda e, b=self.mute_btn: b.config(bg=BTN_MUTE_HOV))  # type: ignore[arg-type]
-        self.mute_btn.bind("<Leave>", lambda e, b=self.mute_btn: b.config(bg=BTN_MUTE))  # type: ignore[arg-type]
 
-        # ── Kick button ────────────────────────
-        self.kick_btn = tk.Button(
-            right, text="⚡  Kick Selected",
-            font=FONT_BOLD, bg=BTN_RED, fg=BTN_FG,
-            activebackground=BTN_RED_HOV, activeforeground=BTN_FG,
-            relief="flat", cursor="hand2", pady=8,
-            command=self._kick_selected,
-        )
-        self.kick_btn.pack(fill="x", pady=(0, 6))
-        self.kick_btn.bind("<Enter>", lambda e, btn=self.kick_btn: btn.config(bg=BTN_RED_HOV))  # type: ignore[arg-type]
-        self.kick_btn.bind("<Leave>", lambda e, btn=self.kick_btn: btn.config(bg=BTN_RED))  # type: ignore[arg-type]
+        # Kick button
+        tk.Button(right, text="⚡  Kick Selected",
+                  font=FONT_BOLD, bg=RED, fg=TEXT,
+                  relief="flat", cursor="hand2", pady=8,
+                  command=self._kick).pack(fill="x", pady=(0, 6))
 
-        # ── Stop server button ─────────────────
-        stop_btn = tk.Button(
-            right, text="🛑  Stop Server",
-            font=FONT_BOLD, bg=INPUT_BG, fg=TEXT_WARN,
-            activebackground="#444466", activeforeground=TEXT_WARN,
-            relief="flat", cursor="hand2", pady=8,
-            command=self._stop_server,
-        )
-        stop_btn.pack(fill="x")
+        # Stop
+        tk.Button(right, text="🛑  Stop Server",
+                  font=FONT_BOLD, bg=CARD, fg=RED,
+                  relief="flat", cursor="hand2", pady=8,
+                  command=self._stop).pack(fill="x")
 
-    # ── Server hooks ─────────────────────────
-    def _hook_server(self) -> None:
-        """Register GUI callbacks into the server module."""
-        server.on_log        = self._on_log
-        server.on_user_join  = self._on_user_join
-        server.on_user_leave = self._on_user_leave
-        server.on_message    = self._on_server_message
-        server.on_mute_update = self._on_mute_update
+    # ── Hooks ─────────────────────────────────────────────────────────────────
+    def _hook(self):
+        server.on_log        = lambda m: self.after(0, self._log, m, "info")
+        server.on_user_join  = lambda u: self.after(0, self._on_join, u)
+        server.on_user_leave = lambda u: self.after(0, self._on_leave, u)
+        server.on_message    = lambda m: self.after(0, self._log, f"  💬  {m}", "msg")
+        server.on_mute_update = lambda: self.after(0, self._refresh_users)
 
-    def _start_server(self) -> None:
-        """Start the server in a background daemon thread."""
-        self._server_thread = threading.Thread(target=server.start, daemon=True)
-        self._server_thread.start()
-        self.after(500, self._set_running_status)  # type: ignore[arg-type]
-
-    def _set_running_status(self) -> None:
-        self.status_lbl.config(text="🟢  Running  •  Port 5555", fg=TEXT_SYSTEM)
-
-    # ── Callbacks (server thread → main thread via after()) ──
-    def _on_log(self, msg: str) -> None:
-        def _do(m=msg):
-            tag = "info"
-            ml = m.lower()
-            if "[queue]" in ml:
-                tag = "queue"
-            elif "[mute]" in ml or "[unmute]" in ml:
-                tag = "mute"
-            elif "[kick]" in ml:
-                tag = "kick"
-            self._append_log(m, tag)
-        self.after(0, _do)
-
-    def _on_user_join(self, username: str) -> None:
-        self.after(0, lambda u=username: (
-            self._append_log(f"  ✅  {u} joined", "join"),
-            self._refresh_users(),
-            self._refresh_stats(),
-        ))
-
-    def _on_user_leave(self, username: str) -> None:
-        self.after(0, lambda u=username: (
-            self._append_log(f"  ❌  {u} left", "leave"),
-            self._refresh_users(),
-            self._refresh_stats(),
-        ))
-
-    def _on_server_message(self, msg: str) -> None:
-        self.after(0, lambda m=msg: self._append_log(f"  💬  {m}", "msg"))
-
-    def _on_mute_update(self) -> None:
-        self.after(0, lambda: (
-            self._refresh_users(),
-            self._refresh_stats(),
-        ))
-
-    # ── Log display ───────────────────────────
-    def _append_log(self, text: str, tag: str = "info") -> None:
-        """Append a line to the log box."""
-        self.log_box.config(state="normal")
-        self.log_box.insert("end", text + "\n", tag)
-        self.log_box.config(state="disabled")
-        self.log_box.see("end")
-
-    # ── Stats bar ─────────────────────────────
-    def _refresh_stats(self) -> None:
-        """Update the offline queue and muted count labels."""
-        with server.lock:
-            total_queued = sum(len(v) for v in server.offline_queue.values())
-        muted_count = len(server.muted_users)
-        self.queue_lbl.config(
-            text=f"📬  Offline queue: {total_queued} pending",
-            fg=TEXT_GOLD if total_queued > 0 else TEXT_DIM,
-        )
-        self.muted_count_lbl.config(
-            text=f"🔇  Muted: {muted_count}",
-            fg=MUTED_COLOR if muted_count > 0 else TEXT_DIM,
-        )
-
-    # ── User list ─────────────────────────────
-    def _refresh_users(self) -> None:
-        """Rebuild the online-user panel."""
-        with server.lock:
-            users = list(server.clients.keys())
-
-        for widget in self.users_frame.winfo_children():
-            widget.destroy()
-        self._selected_user = ""
-
-        for name in users:
-            self._add_user_row(name)
-
-        count = len(users)
-        self.user_count_lbl.config(
-            text=f"{count} user{'s' if count != 1 else ''} online"
-        )
-
-    def _add_user_row(self, name: str) -> None:
-        is_muted = name in server.muted_users
-        row = tk.Frame(self.users_frame, bg=BG_PANEL, cursor="hand2")
-        row.pack(fill="x", pady=2)
-
-        # Online dot / mute icon
-        dot_text = "🔇" if is_muted else "●"
-        dot_color = MUTED_COLOR if is_muted else ONLINE_COLOR
-        dot = tk.Label(row, text=dot_text, fg=dot_color, bg=BG_PANEL, font=FONT_SMALL)
-        dot.pack(side="left")
-
-        lbl = tk.Label(
-            row, text=f"  {name}",
-            font=FONT_MAIN, fg=MUTED_COLOR if is_muted else TEXT_MAIN,
-            bg=BG_PANEL, anchor="w",
-        )
-        lbl.pack(side="left", fill="x")
-
-        # Queued DMs badge
-        with server.lock:
-            queued = len(server.offline_queue.get(name, []))
-        if queued > 0:
-            badge = tk.Label(
-                row, text=f"📬{queued}",
-                font=FONT_SMALL, fg="#1e1e2e", bg=BTN_GOLD,
-                padx=4, pady=1,
-            )
-            badge.pack(side="right", padx=(0, 4))
-
-        def _select(
-            _event: "tk.Event[tk.Widget]",
-            _name: str = name,
-            _row: tk.Frame = row,
-            _lbl: tk.Label = lbl,
-            _dot: tk.Label = dot,
-        ) -> None:
-            self._deselect_all()
-            self._selected_user = _name
-            _row.config(bg=ACCENT)
-            _lbl.config(bg=ACCENT)
-            _dot.config(bg=ACCENT)
-            # Update mute button label based on current mute state
-            if _name in server.muted_users:
-                self.mute_btn.config(text="🔊  Unmute Selected")
-            else:
-                self.mute_btn.config(text="🔇  Mute Selected")
-
-        for widget in (row, lbl, dot):
-            widget.bind("<Button-1>", _select)
-
-    def _deselect_all(self) -> None:
-        """Reset all user-row backgrounds to the default panel colour."""
-        for row in self.users_frame.winfo_children():
-            row.config(bg=BG_PANEL)  # type: ignore[call-arg]
-            for child in row.winfo_children():
-                child.config(bg=BG_PANEL)  # type: ignore[call-arg]
-
-    # ── Admin actions ─────────────────────────
-    def _send_announcement(self) -> None:
-        """Broadcast an admin message to all connected clients."""
-        text = self.announce_entry.get().strip()
-        if not text:
-            messagebox.showinfo("Announce", "Please type an announcement first.", parent=self)
-            return
-        server.broadcast_admin(text)
-        self._append_log(f"  📢  Announcement sent: {text}", "announce")
-        self.announce_entry.delete(0, tk.END)
-
-    def _mute_selected(self) -> None:
-        if not self._selected_user:
-            messagebox.showinfo("Mute", "Please click on a user first.", parent=self)
-            return
-
-        target = self._selected_user
-
-        if target in server.muted_users:
-            # Unmute
-            if server.unmute_user(target):
-                self._append_log(f"  🔊  Unmuted: {target}", "mute")
-                self.mute_btn.config(text="🔇  Mute Selected")
-        else:
-            # Mute
-            if server.mute_user(target):
-                self._append_log(f"  🔇  Muted: {target}", "mute")
-                self.mute_btn.config(text="🔊  Unmute Selected")
-
+    def _on_join(self, u):
+        self._log(f"  ✅  {u} joined", "join")
         self._refresh_users()
         self._refresh_stats()
 
-    def _kick_selected(self) -> None:
-        if not self._selected_user:
-            messagebox.showinfo("Kick", "Please click on a user first.", parent=self)
-            return
+    def _on_leave(self, u):
+        self._log(f"  ❌  {u} left", "leave")
+        self._refresh_users()
+        self._refresh_stats()
 
-        target = self._selected_user
-        if not messagebox.askyesno(
-            "Kick User",
-            f"Are you sure you want to kick '{target}'?",
-            parent=self,
-        ):
-            return
+    def _log(self, text: str, tag: str = "info"):
+        ml = text.lower()
+        if "[queue]" in ml:
+            tag = "queue"
+        elif "[mute]" in ml or "[unmute]" in ml:
+            tag = "mute"
+        elif "[kick]" in ml:
+            tag = "kick"
+        self.log.config(state="normal")
+        self.log.insert("end", text + "\n", tag)
+        self.log.config(state="disabled")
+        self.log.see("end")
 
-        if server.kick_user(target):
-            self._append_log(f"  🔨  Kicked: {target}", "kick")
-            self._refresh_users()
-            self._refresh_stats()
-            self.mute_btn.config(text="🔇  Mute Selected")
+    # ── Stats ─────────────────────────────────────────────────────────────────
+    def _refresh_stats(self):
+        with server.lock:
+            q = sum(len(v) for v in server.offline_queue.values())
+        m = len(server.muted_users)
+        self.queue_lbl.config(text=f"📬  Queue: {q}", fg=GOLD if q else DIM)
+        self.muted_lbl.config(text=f"🔇  Muted: {m}", fg=MUTED_C if m else DIM)
+
+    # ── Users ─────────────────────────────────────────────────────────────────
+    def _refresh_users(self):
+        with server.lock:
+            users = list(server.clients.keys())
+        for w in self.user_frame.winfo_children():
+            w.destroy()
+        self._selected = ""
+        self.mute_btn.config(text="🔇  Mute Selected")
+
+        for name in users:
+            muted = name in server.muted_users
+            dot = "🔇" if muted else "●"
+            dot_c = MUTED_C if muted else ONLINE_C
+            fg_c = MUTED_C if muted else TEXT
+
+            row = tk.Frame(self.user_frame, bg=PANEL, cursor="hand2")
+            row.pack(fill="x", pady=2)
+
+            tk.Label(row, text=dot, fg=dot_c, bg=PANEL,
+                     font=FONT_SMALL).pack(side="left", padx=(4, 2))
+            lbl = tk.Label(row, text=name, font=FONT, fg=fg_c,
+                           bg=PANEL, anchor="w")
+            lbl.pack(side="left", fill="x")
+
+            with server.lock:
+                q = len(server.offline_queue.get(name, []))
+            if q:
+                tk.Label(row, text=f"📬{q}", font=FONT_SMALL,
+                         fg="#0d1117", bg=GOLD, padx=4).pack(side="right")
+
+            def _sel(_e, n=name, r=row, l=lbl):
+                for row2 in self.user_frame.winfo_children():
+                    row2.config(bg=PANEL)
+                    for c in row2.winfo_children():
+                        c.config(bg=PANEL)
+                r.config(bg=ACCENT2)
+                l.config(bg=ACCENT2)
+                self._selected = n
+                self.mute_btn.config(
+                    text="🔊  Unmute Selected" if n in server.muted_users
+                    else "🔇  Mute Selected"
+                )
+
+            row.bind("<Button-1>", _sel)
+            lbl.bind("<Button-1>", _sel)
+
+        cnt = len(users)
+        self.user_count.config(text=f"{cnt} user{'s' if cnt != 1 else ''} online")
+        self._refresh_stats()
+
+    # ── Actions ───────────────────────────────────────────────────────────────
+    def _announce(self):
+        text = self.ann_entry.get().strip()
+        if not text:
+            messagebox.showinfo("Announce", "Type a message first.", parent=self)
+            return
+        server.broadcast_admin(text)
+        self._log(f"  📢  Announced: {text}", "ann")
+        self.ann_entry.delete(0, tk.END)
+
+    def _mute(self):
+        if not self._selected:
+            messagebox.showinfo("Mute", "Select a user first.", parent=self)
+            return
+        if self._selected in server.muted_users:
+            if server.unmute_user(self._selected):
+                self._log(f"  🔊  Unmuted: {self._selected}", "mute")
         else:
-            messagebox.showwarning(
-                "Kick", f"'{target}' is no longer connected.", parent=self
-            )
+            if server.mute_user(self._selected):
+                self._log(f"  🔇  Muted: {self._selected}", "mute")
+        self._refresh_users()
 
-    def _stop_server(self) -> None:
-        if not messagebox.askyesno(
-            "Stop Server",
-            "Stop the server? All clients will be disconnected.",
-            parent=self,
-        ):
+    def _kick(self):
+        if not self._selected:
+            messagebox.showinfo("Kick", "Select a user first.", parent=self)
             return
-        server.stop()
-        self.status_lbl.config(text="🔴  Stopped", fg=TEXT_WARN)
-        self._append_log("  🛑  Server stopped by admin.", "kick")
+        if messagebox.askyesno("Kick", f"Kick '{self._selected}'?", parent=self):
+            if server.kick_user(self._selected):
+                self._log(f"  ⚡  Kicked: {self._selected}", "kick")
+            self._refresh_users()
 
-    # ── Close ─────────────────────────────────
-    def _on_close(self) -> None:
+    def _stop(self):
+        if messagebox.askyesno("Stop", "Stop the server?", parent=self):
+            server.stop()
+            self.status_lbl.config(text="🔴  Stopped", fg=RED)
+            self._log("  🛑  Server stopped.", "kick")
+
+    def _close(self):
         server.stop()
         self.destroy()
 
 
 if __name__ == "__main__":
-    app = ServerAdminGUI()
+    app = ServerGUI()
     app.mainloop()
